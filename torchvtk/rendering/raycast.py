@@ -234,8 +234,8 @@ class VolumeRaycaster(nn.Module):
         if tf is not None:
             if isinstance(tf, list): vol = apply_tf_torch(vol, tf) # TF points
             else:                    vol = apply_tf_tex_torch(vol, tf) # TF Tex
-        density = vol[:, [3]].permute(0, 1, 4, 3, 2) # (BS, C, D, H, W) -> (BS, C, W, H, D) for this layer
-        color   = vol[:, :3 ].permute(0, 1, 4, 3, 2) # same
+        density = vol[:, [-1]].permute(0, 1, 4, 3, 2) # (BS, C, D, H, W) -> (BS, C, W, H, D) for this layer
+        color   = vol[:, :-1 ].permute(0, 1, 4, 3, 2) # same
         bs = color.size(0)
         # Expand for all items in batch
         sample_coords = self.samples.expand(bs, -1, -1, -1, -1).to(vol.device).to(vol.dtype)
