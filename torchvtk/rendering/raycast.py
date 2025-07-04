@@ -5,6 +5,7 @@
 import math
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 from torch import nn
 import numpy as np
 
@@ -220,7 +221,7 @@ class VolumeRaycaster(nn.Module):
         R[torch.isnan(R).sum(dim=(1,2)).bool()] = torch.flip(torch.eye(3, dtype=nu.dtype, device=nu.device), [0])
         return R
 
-    def forward(self, vol, tf=None, view_mat=None, output_alpha=False):
+    def forward(self, vol, tf=None, view_mat=None, output_alpha=False, tile_size=8):
         ''' Renders a volume (with given view matrix) using raycasting.
         Args:
             vol (Tensor): Batch of volumes to render. Shape (BS, C, D, H, W). C=1 if `tf` is given.
@@ -234,33 +235,58 @@ class VolumeRaycaster(nn.Module):
         if tf is not None:
             if isinstance(tf, list): vol = apply_tf_torch(vol, tf) # TF points
             else:                    vol = apply_tf_tex_torch(vol, tf) # TF Tex
-        density = vol[:, [-1]].permute(0, 1, 4, 3, 2) # (BS, C, D, H, W) -> (BS, C, W, H, D) for this layer
-        color   = vol[:, :-1 ].permute(0, 1, 4, 3, 2) # same
+     # Split volume into density and color
+        density = vol[:, [-1]].permute(0, 1, 4, 3, 2).contiguous()  # (B, 1, W, H, D)
+        color   = vol[:, :-1 ].permute(0, 1, 4, 3, 2).contiguous()  # (B, C-1, W, H, D)
         bs = color.size(0)
-        # Expand for all items in batch
-        sample_coords = self.samples.expand(bs, -1, -1, -1, -1).to(vol.device).to(vol.dtype)
+
+        # Expand and move samples to device
+        sample_coords = self.samples.expand(bs, -1, -1, -1, -1).to(device=vol.device, dtype=vol.dtype)
         if view_mat is not None:
             old_shape = sample_coords.shape
-            sample_coords = homogenize_vec(sample_coords.reshape(bs, -1, 3).permute(0,2,1))
-            sample_coords = torch.matmul(view_mat, sample_coords).permute(0,2,1)[...,:3].reshape(old_shape)
-            sample_coords *= 1.3 #torch.norm(view_mat[:, 3, :3]) / 2# scale to match ground truth scale
+            sample_coords = homogenize_vec(sample_coords.reshape(bs, -1, 3).permute(0, 2, 1))
+            sample_coords = torch.matmul(view_mat, sample_coords).permute(0, 2, 1)[..., :3].reshape(old_shape)
+            sample_coords *= 1.3
 
-        # Compute opacity and transmission along rays
-        density = self.density_factor * density / self.ray_samples
-        density = F.grid_sample(density, sample_coords)
-        transmission = torch.cumprod(1.0 - density, dim=2)
-        # Get sample weighting
-        weight = density * transmission
-        w_sum  = torch.sum(weight, dim=2)
-        # Sample colors
-        color = F.grid_sample(color, sample_coords)
-        # Composite alpha and colors
-        render = torch.sum(weight * color, dim=2) / (w_sum + 1e-6)
-        alpha  = 1.0 - torch.prod(1 - density, dim=2)
-        render = render * alpha
-        # Concatenate to RGBA image
-        if output_alpha: return torch.cat([render, alpha], dim=1)
-        else:            return render
+        # Prepare output accumulation
+        B, S, H, W, _ = sample_coords.shape
+        out_rgb = []
+        out_alpha = []
+
+        # Define a checkpointable per-tile function
+        def tile_render_fn(density, color, coords_tile):
+            dens_tile = F.grid_sample(density, coords_tile, align_corners=False)
+            dens_tile = self.density_factor * dens_tile / self.ray_samples
+
+            inv_dens = 1.0 - dens_tile
+            transmission = torch.cumprod(inv_dens, dim=2)
+            weight = dens_tile * transmission
+            w_sum = torch.sum(weight, dim=2)
+
+            color_tile = F.grid_sample(color, coords_tile, align_corners=False)
+            render_tile = torch.sum(weight * color_tile, dim=2) / (w_sum + 1e-6)
+            alpha_tile = 1.0 - torch.prod(1 - dens_tile, dim=2)
+            render_tile = render_tile * alpha_tile
+
+            return render_tile, alpha_tile
+
+        # Chunk along H and checkpoint each tile
+        for h0 in range(0, H, tile_size):
+            h1 = min(h0 + tile_size, H)
+            coords_tile = sample_coords[:, :, h0:h1]  # (B, S, tile, W, 3)
+
+            # Use checkpointing
+            render_tile, alpha_tile = cp.checkpoint(tile_render_fn, density, color, coords_tile, use_reentrant=False)
+
+            out_rgb.append(render_tile)
+            out_alpha.append(alpha_tile)
+
+        render = torch.cat(out_rgb, dim=2)
+        if output_alpha:
+            alpha = torch.cat(out_alpha, dim=2)
+            return torch.cat([render, alpha], dim=1)
+        else:
+            return render
 
 
 # %%
