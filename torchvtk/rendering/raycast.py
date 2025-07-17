@@ -271,19 +271,14 @@ class VolumeRaycaster(nn.Module):
             return render_tile, alpha_tile
 
         # Chunk along batch and height dimensions
-        batch_chunk_size = 4
-        for b0 in range(0, B, batch_chunk_size):
-            b1 = min(b0 + batch_chunk_size, B)
-
+        for b in range(B):
             for h0 in range(0, H, tile_size):
                 h1 = min(h0 + tile_size, H)
 
-                # Slice inputs
-                coords_tile = sample_coords[b0:b1, :, h0:h1]  # (b_chunk, S, tile, W, 3)
-                density_tile = density[b0:b1]  # slice batch
-                color_tile = color[b0:b1]  # slice batch
+                coords_tile = sample_coords[b:b + 1, :, h0:h1]  # keep as MetaTensor with batch size 1
+                density_tile = density[b:b + 1]
+                color_tile = color[b:b + 1]
 
-                # Use checkpointing
                 render_tile, alpha_tile = cp.checkpoint(
                     tile_render_fn, density_tile, color_tile, coords_tile, use_reentrant=False
                 )
