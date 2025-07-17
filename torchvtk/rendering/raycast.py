@@ -221,7 +221,7 @@ class VolumeRaycaster(nn.Module):
         R[torch.isnan(R).sum(dim=(1,2)).bool()] = torch.flip(torch.eye(3, dtype=nu.dtype, device=nu.device), [0])
         return R
 
-    def forward(self, vol, tf=None, view_mat=None, output_alpha=False, tile_size=8):
+    def forward(self, vol, tf=None, view_mat=None, output_alpha=False, tile_size=64):
         ''' Renders a volume (with given view matrix) using raycasting.
         Args:
             vol (Tensor): Batch of volumes to render. Shape (BS, C, D, H, W). C=1 if `tf` is given.
@@ -270,21 +270,17 @@ class VolumeRaycaster(nn.Module):
 
             return render_tile, alpha_tile
 
-        # Chunk along batch and height dimensions
-        for b in range(B):
-            for h0 in range(0, H, tile_size):
-                h1 = min(h0 + tile_size, H)
+        # Chunk along H and checkpoint each tile
+        for h0 in range(0, H, tile_size):
+            h1 = min(h0 + tile_size, H)
+            coords_tile = sample_coords[:, :, h0:h1]  # (B, S, tile, W, 3)
 
-                coords_tile = sample_coords[b:b + 1, :, h0:h1]  # keep as MetaTensor with batch size 1
-                density_tile = density[b:b + 1]
-                color_tile = color[b:b + 1]
+            # Use checkpointing
+            render_tile, alpha_tile = cp.checkpoint(tile_render_fn, density, color, coords_tile,
+                                                    use_reentrant=False)
 
-                render_tile, alpha_tile = cp.checkpoint(
-                    tile_render_fn, density_tile, color_tile, coords_tile, use_reentrant=False
-                )
-
-                out_rgb.append(render_tile)
-                out_alpha.append(alpha_tile)
+            out_rgb.append(render_tile)
+            out_alpha.append(alpha_tile)
 
         render = torch.cat(out_rgb, dim=2)
         if output_alpha:
