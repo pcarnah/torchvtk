@@ -270,16 +270,26 @@ class VolumeRaycaster(nn.Module):
 
             return render_tile, alpha_tile
 
-        # Chunk along H and checkpoint each tile
-        for h0 in range(0, H, tile_size):
-            h1 = min(h0 + tile_size, H)
-            coords_tile = sample_coords[:, :, h0:h1]  # (B, S, tile, W, 3)
+        # Chunk along batch and height dimensions
+        batch_chunk_size = 4
+        for b0 in range(0, B, batch_chunk_size):
+            b1 = min(b0 + batch_chunk_size, B)
 
-            # Use checkpointing
-            render_tile, alpha_tile = cp.checkpoint(tile_render_fn, density, color, coords_tile, use_reentrant=False)
+            for h0 in range(0, H, tile_size):
+                h1 = min(h0 + tile_size, H)
 
-            out_rgb.append(render_tile)
-            out_alpha.append(alpha_tile)
+                # Slice inputs
+                coords_tile = sample_coords[b0:b1, :, h0:h1]  # (b_chunk, S, tile, W, 3)
+                density_tile = density[b0:b1]  # slice batch
+                color_tile = color[b0:b1]  # slice batch
+
+                # Use checkpointing
+                render_tile, alpha_tile = cp.checkpoint(
+                    tile_render_fn, density_tile, color_tile, coords_tile, use_reentrant=False
+                )
+
+                out_rgb.append(render_tile)
+                out_alpha.append(alpha_tile)
 
         render = torch.cat(out_rgb, dim=2)
         if output_alpha:
