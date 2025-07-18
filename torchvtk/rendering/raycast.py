@@ -221,7 +221,7 @@ class VolumeRaycaster(nn.Module):
         R[torch.isnan(R).sum(dim=(1,2)).bool()] = torch.flip(torch.eye(3, dtype=nu.dtype, device=nu.device), [0])
         return R
 
-    def forward(self, vol, tf=None, view_mat=None, output_alpha=False, tile_size=64):
+    def forward(self, vol, tf=None, view_mat=None, output_alpha=False, tile_size=16):
         ''' Renders a volume (with given view matrix) using raycasting.
         Args:
             vol (Tensor): Batch of volumes to render. Shape (BS, C, D, H, W). C=1 if `tf` is given.
@@ -230,15 +230,16 @@ class VolumeRaycaster(nn.Module):
             output_alpha (bool): Whether to output RGBA instead of RGB. Default is False
 
         Returns:
-            Batch of raycast images of shape (BS, 3, H, W) with RGB (and optionally Alpha) channels
+            Batch of raycast images of shape (BS, C, H, W)
         '''
         if tf is not None:
             if isinstance(tf, list): vol = apply_tf_torch(vol, tf) # TF points
             else:                    vol = apply_tf_tex_torch(vol, tf) # TF Tex
      # Split volume into density and color
-        density = vol[:, [-1]].permute(0, 1, 4, 3, 2).contiguous()  # (B, 1, W, H, D)
-        color   = vol[:, :-1 ].permute(0, 1, 4, 3, 2).contiguous()  # (B, C-1, W, H, D)
-        bs = color.size(0)
+     #    density = vol[:, [-1]].permute(0, 1, 4, 3, 2).contiguous()  # (B, 1, W, H, D)
+     #    color   = vol[:, :-1 ].permute(0, 1, 4, 3, 2).contiguous()  # (B, C-1, W, H, D)
+        density = vol.permute(0, 1, 4, 3, 2).contiguous()  # (B, C, W, H, D)
+        bs = density.size(0)
 
         # Expand and move samples to device
         sample_coords = self.samples.expand(bs, -1, -1, -1, -1).to(device=vol.device, dtype=vol.dtype)
@@ -254,7 +255,7 @@ class VolumeRaycaster(nn.Module):
         out_alpha = []
 
         # Define a checkpointable per-tile function
-        def tile_render_fn(density, color, coords_tile):
+        def tile_render_fn(density, coords_tile):
             dens_tile = F.grid_sample(density, coords_tile, align_corners=False)
             dens_tile = self.density_factor * dens_tile / self.ray_samples
 
@@ -262,9 +263,10 @@ class VolumeRaycaster(nn.Module):
             transmission = torch.cumprod(inv_dens, dim=2)
             weight = dens_tile * transmission
             w_sum = torch.sum(weight, dim=2)
+            render_tile = torch.sum(weight, dim=2) / (w_sum + 1e-6)
 
-            color_tile = F.grid_sample(color, coords_tile, align_corners=False)
-            render_tile = torch.sum(weight * color_tile, dim=2) / (w_sum + 1e-6)
+            # color_tile = F.grid_sample(color, coords_tile, align_corners=False)
+            # render_tile = torch.sum(weight * color_tile, dim=2) / (w_sum + 1e-6)
             alpha_tile = 1.0 - torch.prod(1 - dens_tile, dim=2)
             render_tile = render_tile * alpha_tile
 
@@ -276,7 +278,7 @@ class VolumeRaycaster(nn.Module):
             coords_tile = sample_coords[:, :, h0:h1]  # (B, S, tile, W, 3)
 
             # Use checkpointing
-            render_tile, alpha_tile = cp.checkpoint(tile_render_fn, density, color, coords_tile,
+            render_tile, alpha_tile = cp.checkpoint(tile_render_fn, density, coords_tile,
                                                     use_reentrant=False)
 
             out_rgb.append(render_tile)
