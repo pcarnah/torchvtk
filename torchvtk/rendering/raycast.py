@@ -146,7 +146,7 @@ def get_random_pos(bs=1, distance=(1,5)):
 
 #%%
 class VolumeRaycaster(nn.Module):
-    def __init__(self, density_factor=100.0, ray_samples=256, resolution=(224,224)):
+    def __init__(self, density_factor=100.0, ray_samples=256, resolution=(224,224), use_checkpointing=False):
         ''' Initializes differentiable raycasting layer
 
         Args:
@@ -275,10 +275,12 @@ class VolumeRaycaster(nn.Module):
             h1 = min(h0 + tile_size, H)
             coords_tile = sample_coords[:, :, h0:h1]  # (B, S, tile, W, 3)
 
-            # # Use checkpointing
-            # render_tile, alpha_tile = cp.checkpoint(tile_render_fn, density, coords_tile,
-            #                                         use_reentrant=False)
-            render_tile, alpha_tile = tile_render_fn(density, coords_tile)
+            # Use checkpointing
+            if self.use_checkpointing:
+                render_tile, alpha_tile = cp.checkpoint(tile_render_fn, density, coords_tile,
+                                                        use_reentrant=False)
+            else:
+                render_tile, alpha_tile = tile_render_fn(density, coords_tile)
 
             out_rgb.append(render_tile)
             out_alpha.append(alpha_tile)
