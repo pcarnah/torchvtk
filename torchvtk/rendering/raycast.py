@@ -11,6 +11,8 @@ import numpy as np
 
 from torchvtk.utils import make_2d, apply_tf_torch, apply_tf_tex_torch
 
+from timeit import default_timer as timer
+
 __all__ = ['homogenize_mat', 'homogenize_vec', 'get_proj_mat', 'get_view_mat', 'get_random_pos', 'VolumeRaycaster']
 
 def homogenize_mat(mat):
@@ -221,7 +223,7 @@ class VolumeRaycaster(nn.Module):
         R[torch.isnan(R).sum(dim=(1,2)).bool()] = torch.flip(torch.eye(3, dtype=nu.dtype, device=nu.device), [0])
         return R
 
-    def forward(self, vol, tf=None, view_mat=None, output_alpha=False, tile_size=16):
+    def forward(self, vol, view_mat=None, output_alpha=False, tile_size=16):
         ''' Renders a volume (with given view matrix) using raycasting.
         Args:
             vol (Tensor): Batch of volumes to render. Shape (BS, C, D, H, W). C=1 if `tf` is given.
@@ -232,9 +234,6 @@ class VolumeRaycaster(nn.Module):
         Returns:
             Batch of raycast images of shape (BS, C, H, W)
         '''
-        if tf is not None:
-            if isinstance(tf, list): vol = apply_tf_torch(vol, tf) # TF points
-            else:                    vol = apply_tf_tex_torch(vol, tf) # TF Tex
      # Split volume into density and color
      #    density = vol[:, [-1]].permute(0, 1, 4, 3, 2).contiguous()  # (B, 1, W, H, D)
      #    color   = vol[:, :-1 ].permute(0, 1, 4, 3, 2).contiguous()  # (B, C-1, W, H, D)
@@ -269,7 +268,6 @@ class VolumeRaycaster(nn.Module):
             # render_tile = torch.sum(weight * color_tile, dim=2) / (w_sum + 1e-6)
             alpha_tile = 1.0 - torch.prod(1 - dens_tile, dim=2)
             render_tile = render_tile * alpha_tile
-
             return render_tile, alpha_tile
 
         # Chunk along H and checkpoint each tile
@@ -277,9 +275,10 @@ class VolumeRaycaster(nn.Module):
             h1 = min(h0 + tile_size, H)
             coords_tile = sample_coords[:, :, h0:h1]  # (B, S, tile, W, 3)
 
-            # Use checkpointing
-            render_tile, alpha_tile = cp.checkpoint(tile_render_fn, density, coords_tile,
-                                                    use_reentrant=False)
+            # # Use checkpointing
+            # render_tile, alpha_tile = cp.checkpoint(tile_render_fn, density, coords_tile,
+            #                                         use_reentrant=False)
+            render_tile, alpha_tile = tile_render_fn(density, coords_tile)
 
             out_rgb.append(render_tile)
             out_alpha.append(alpha_tile)
@@ -292,7 +291,22 @@ class VolumeRaycaster(nn.Module):
             return render
 
 
-# %%
+if __name__ == '__main__':
+    ren = VolumeRaycaster().cuda()
+    vol = torch.rand(8, 1, 128, 128, 128).cuda()
+    vol.requires_grad_(True)
+    view_mat = get_view_mat(torch.tensor([0, 0, 1.0])).cuda()
+    start = timer()
+    out = ren(vol, view_mat=view_mat, tile_size=64)
+    torch.cuda.synchronize()
+    end = timer()
+    print(out.shape, end-start)
+
+    start = timer()
+    out.sum().backward()
+    torch.cuda.synchronize()
+    end = timer()
+    print(end-start)
 
 
-# %%
+    print(torch.cuda.memory_summary())
