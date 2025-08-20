@@ -157,6 +157,7 @@ class VolumeRaycaster(nn.Module):
         super().__init__()
         self.density_factor = density_factor
         self.ray_samples    = ray_samples
+        self.use_checkpointing = use_checkpointing
         if isinstance(resolution, tuple):
               self.w, self.h = resolution
         else: self.w, self.h = resolution, resolution
