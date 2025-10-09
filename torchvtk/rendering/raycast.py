@@ -3,9 +3,13 @@
 # See https://github.com/henzler/platonicgan/blob/master/scripts/renderer
 #%%
 import math
+from typing import Tuple, Optional
+
+import monai.data
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
+from monai.networks.blocks import Convolution
 from torch import nn
 import numpy as np
 
@@ -13,7 +17,7 @@ from torchvtk.utils import make_2d, apply_tf_torch, apply_tf_tex_torch
 
 from timeit import default_timer as timer
 
-__all__ = ['homogenize_mat', 'homogenize_vec', 'get_proj_mat', 'get_view_mat', 'get_random_pos', 'VolumeRaycaster']
+__all__ = ['homogenize_mat', 'homogenize_vec', 'get_proj_mat', 'get_view_mat', 'get_vtk_view_mat', 'get_random_pos', 'VolumeRaycaster']
 
 def homogenize_mat(mat):
     ''' Adds a row (bottom) and column (right) to the matrix `mat` with all zeros and a 1 in the lower right corner.
@@ -117,6 +121,36 @@ def lookAt(look_from, look_up=None):
     fmat = torch.matmul(mat, tmat).permute(0, 2, 1)
     return fmat
 
+
+def get_vtk_view_mat(cam_pos: Tuple[float],  # (3,) camera center in RAS
+                     cam_focal: Tuple[float],  # (3,) camera focal point in RAS
+                     cam_viewup: Tuple[float],  # (3,) view-up vector in RAS)
+                     device: str = 'cpu'):
+    cam_pos = torch.as_tensor(cam_pos, dtype=torch.float32)
+    cam_focal = torch.as_tensor(cam_focal, dtype=torch.float32)
+    cam_viewup = torch.as_tensor(cam_viewup, dtype=torch.float32)
+
+    # Construct VTK-compatible camera axes
+    forward = torch.nn.functional.normalize(cam_focal - cam_pos, dim=0)  # +Z axis (direction of projection in VTK)
+    right = torch.nn.functional.normalize(torch.linalg.cross(forward, cam_viewup), dim=0)
+    up = torch.linalg.cross(right, forward)  # True up direction
+
+    # VTK Camera: camera is at cam_pos, looking at cam_focal, with 'up' vector cam_viewup
+    # Form rotation (world-to-camera) matrix
+    rot = torch.stack([right, up, -forward], dim=1)  # camera convention: X=right, Y=up, Z=backward
+    trans = -rot.T @ cam_pos  # translation to position the camera at cam_pos
+
+    # View matrix (world-to-camera)
+    view_mat = torch.zeros(4, 4, device=device)
+    view_mat[:3, 0] = right
+    view_mat[:3, 1] = up
+    view_mat[:3, 2] = -forward  # Negative for right-handed system
+    view_mat[:3, 3] = cam_pos
+    view_mat[3, 3] = 1.0
+
+    return view_mat
+
+
 def get_rot_mat(look_from, old_look_from=None):
     if old_look_from is None:
         old_look_from = torch.zeros_like(look_from)
@@ -130,6 +164,7 @@ def get_rot_mat(look_from, old_look_from=None):
                        [ v[:,2],    0,   -v[:,0]],
                        [-v[:,1],  v[:,0],    0  ]])
     return torch.eye(3) + vx + vx**2 * (1/(1+c))
+
 def get_random_pos(bs=1, distance=(1,5)):
     ''' Computes a vector of random positions.
     Args:
@@ -144,9 +179,149 @@ def get_random_pos(bs=1, distance=(1,5)):
         d = distance
     return F.normalize(torch.randn(bs, 3)) * d
 
+def piecewise_linear_channelwise(x, xp, yp):
+    """
+    Apply a per-channel piecewise linear function to input x.
+    Handles extrapolation beyond xp bounds by extending the first/last segment.
+
+    Args:
+        x (Tensor): Input (B, C, H, W) or (B, C, D, H, W)
+        xp (Tensor): (C, K) sorted x keypoints per channel
+        yp (Tensor): (C, K) y values per channel at keypoints
+
+    Returns:
+        Tensor: Output of same shape as x
+    """
+    if xp.ndim != 2 or yp.ndim != 2 or xp.shape != yp.shape:
+        print(xp.shape, yp.shape)
+        raise ValueError("xp and yp must have shape (C, K)")
+    B, C = x.shape[:2]
+    x_flat = x.view(B, C, -1)  # (B, C, N)
+
+    K = xp.shape[1]
+    xp = xp.unsqueeze(0).expand(B, -1, -1)  # (B, C, K)
+    yp = yp.unsqueeze(0).expand(B, -1, -1)
+
+    x_unsq = x_flat.unsqueeze(-1)  # (B, C, N, 1)
+    xp_left = xp.unsqueeze(2)[:, :, :, :-1]  # (B, C, 1, K-1)
+    xp_right = xp.unsqueeze(2)[:, :, :, 1:]
+
+    # Mask to identify correct segment
+    mask = (x_unsq >= xp_left) & (x_unsq < xp_right)
+
+    # If no valid segment (i.e. x >= xp[-1]), assign to last segment
+    none_selected = ~mask.any(dim=-1)
+    idx = mask.float().argmax(dim=-1)  # (B, C, N)
+    idx[none_selected] = K - 2  # assign last interval
+
+    # Safe gather
+    gather_idx = idx.unsqueeze(-1)
+    xp_l = torch.gather(xp, 2, idx)
+    xp_r = torch.gather(xp, 2, idx + 1)
+    yp_l = torch.gather(yp, 2, idx)
+    yp_r = torch.gather(yp, 2, idx + 1)
+
+    # Linear interpolation
+    denom = xp_r - xp_l
+    denom = torch.where(denom == 0, torch.ones_like(denom), denom)  # avoid div0
+    xval = x_flat
+    yval = yp_l + (yp_r - yp_l) * ((xval - xp_l) / denom)
+
+    return yval.view_as(x)
+
+
+class ASPP(nn.Module):
+    def __init__(self, in_ch, out_ch, rates=(1, 2, 4, 8)):
+        super().__init__()
+        self.branches = nn.ModuleList([
+            nn.Conv2d(in_ch, out_ch, 3, padding=r, dilation=r) for r in rates
+        ])
+        self.proj = nn.Conv2d(out_ch * len(rates), out_ch, 1)
+
+        # init
+        for m in self.branches:
+            nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+            nn.init.zeros_(m.bias)
+        nn.init.kaiming_normal_(self.proj.weight, nonlinearity="relu")
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x):
+        feats = [F.relu(branch(x)) for branch in self.branches]
+        return self.proj(torch.cat(feats, dim=1))
+
+class DepthAwareScatter(nn.Module):
+    def __init__(self, in_ch, base_ch=32, alpha_max=0.4):
+        super().__init__()
+        self.alpha_max = alpha_max
+
+        # depth mixing: causal 1D conv over D
+        self.depth_conv = nn.Conv1d(in_ch, in_ch, kernel_size=5, padding=4, dilation=2)
+        nn.init.kaiming_normal_(self.depth_conv.weight, nonlinearity="relu")
+        nn.init.zeros_(self.depth_conv.bias)
+
+        # conditioning features → ASPP
+        self.enc = nn.Conv2d(in_ch * 2, base_ch, 1)
+        self.aspp = ASPP(base_ch, base_ch)
+        self.alpha_head = nn.Conv2d(base_ch, 1, 1)
+        nn.init.kaiming_normal_(self.alpha_head.weight, nonlinearity="relu")
+        nn.init.constant_(self.alpha_head.bias, -3.0)  # α ≈ 0 at init
+
+        # lateral scatter mixing
+        self.scatter_conv = nn.Conv2d(in_ch + base_ch, 1, 3, padding=1)
+        nn.init.kaiming_normal_(self.scatter_conv.weight, nonlinearity="relu")  # no scatter initially
+        nn.init.zeros_(self.scatter_conv.bias)
+
+
+    def forward(self, mu, dz=1.0):
+        # mu: [B,C,D,H,W], I0 = 1
+        B, C, D, H, W = mu.shape
+
+        # integrate attenuation
+        tau_z = torch.cumsum(mu * dz, dim=2)           # [B,C,D,H,W]
+        I_z   = torch.exp(-tau_z)                           # [B,C,D,H,W]
+        I_primary = I_z[:, :, -1]                           # [B,C,H,W]
+
+        # scatter source per depth
+        S_z = mu * dz * I_z                            # [B,C,D,H,W]
+
+        # depth-aware weighting (causal conv along D)
+        # reshape to [B*H*W, C, D]
+        S_z_perm = S_z.permute(0, 3, 4, 1, 2).contiguous()  # [B,H,W,C,D]
+        S_z_flat = S_z_perm.view(-1, C, D)                  # [B*H*W, C, D]
+        S_w = self.depth_conv(S_z_flat)                     # [B*H*W, C, D]
+        S_w = S_w.view(B, H, W, C, D).permute(0, 3, 4, 1, 2)  # [B,C,D,H,W]
+        S = S_w.sum(dim=2)                                  # [B,C,H,W]
+
+        # conditioning features
+        tau_exit = tau_z[:, :, -1]                          # [B,C,H,W]
+        feats = torch.cat([I_primary, tau_exit], dim=1)     # [B,2C,H,W]
+        F0 = F.relu(self.enc(feats))                        # [B,base,H,W]
+
+        # ASPP context
+        F_aspp = self.aspp(F0)                              # [B,base,H,W]
+
+        # scatter map
+        scatter_in = torch.cat([S, F_aspp], dim=1)          # [B,C+base,H,W]
+        scatter_map = F.relu(self.scatter_conv(scatter_in)) # [B,1,H,W]
+
+        # alpha gate
+        alpha = torch.sigmoid(self.alpha_head(F_aspp)) * self.alpha_max
+
+        # output
+        I_out = I_primary + alpha * scatter_map
+        return I_out, I_primary, scatter_map, alpha
+
 #%%
 class VolumeRaycaster(nn.Module):
-    def __init__(self, density_factor=100.0, ray_samples=256, resolution=(224,224), use_checkpointing=False):
+    def __init__(
+            self,
+            density_factor: float = 100.0,
+            ray_samples: int = 256,
+            resolution: Tuple[int, int] = (224, 224),
+            use_checkpointing: bool = False,
+            use_beer_lambert: bool = True,
+            scatter: Optional[int] = None,  # or int | None if Python 3.10+
+    ) -> None:
         ''' Initializes differentiable raycasting layer
 
         Args:
@@ -158,16 +333,46 @@ class VolumeRaycaster(nn.Module):
         self.density_factor = density_factor
         self.ray_samples    = ray_samples
         self.use_checkpointing = use_checkpointing
+        self.use_beer_lambert = use_beer_lambert
+        self.scatter = None
+
         if isinstance(resolution, tuple):
               self.w, self.h = resolution
         else: self.w, self.h = resolution, resolution
 
-        Z = torch.linspace(-1, 1, ray_samples)
-        W = torch.linspace(-1, 1, self.w)
-        H = torch.linspace(-1, 1, self.h)
-        self.samples = self.get_coord_grid(Z, H, W, perspective=True)
+        # Z = torch.linspace(-1, 1, ray_samples)
+        # W = torch.linspace(-1, 1, self.w)
+        # H = torch.linspace(-1, 1, self.h)
+        # self.samples = self.get_coord_grid(Z, H, W, perspective=True)
 
-    def get_coord_grid(self, z, y, x, perspective=False, fovy=0.52, ar=1.0):
+        # Build image grid in normalized device coordinates (NDC): x:[-1,1], y:[-1,1] (centered at pixels)
+        y, x = torch.meshgrid(
+            torch.linspace(-1, 1, self.h),  # vertical: -1 (bottom) to 1 (top)
+            torch.linspace(-1, 1, self.w),  # horizontal: -1 (left) to 1 (right)
+            indexing='ij'
+        )
+
+        if scatter is not None:
+            self.scatter_channels = scatter
+            self.scatter = DepthAwareScatter(scatter)
+
+
+        # Vertical FOV in radians
+        fov_y = np.deg2rad(20.0)
+        aspect = self.w / self.h
+        # Compute direction vectors in camera coordinates
+        px = x * np.tan(fov_y / 2) * aspect
+        py = y * np.tan(fov_y / 2)
+        pz = torch.ones_like(px)
+        dirs_cam = torch.stack([px, -py, -pz], dim=-1)  # shape: (H, W, 3)
+
+
+        # Normalize directions
+        # dirs_cam = dirs_cam / torch.norm(dirs_cam, dim=-1, keepdim=True).unsqueeze(0)
+        dirs_cam = F.normalize(dirs_cam, dim=-1)
+        self.register_buffer('dirs_cam', dirs_cam)
+
+    def get_coord_grid(self, z, y, x, perspective=False, fovy=0.20, ar=1.0):
         ''' Computes the samples given linspaces of the correct sizes for each spatial dimension. '''
         z, y, x = torch.meshgrid(z, y, x)
         coords = torch.stack([x, y, z], dim=-1)
@@ -213,6 +418,71 @@ class VolumeRaycaster(nn.Module):
         samples = torch.stack([x,y,z, torch.ones_like(x)], dim=-1).expand(bs,-1,-1,-1,-1)
         samples_poses = torch.bmm(samples.reshape(bs, -1, 4), inv_tfm).reshape(bs, self.ray_samples, self.h, self.w, 4)
 
+
+    def generate_vtk_ray_samples_ijk(self,
+            vol_shape,  # (W, H, D) volume shape in voxels
+            ras2ijk: torch.Tensor,  # 4x4 RAS to IJK transform
+            view_mat: torch.Tensor,
+            fov_y_deg: float,  # vertical FOV in degrees (VTK's ViewAngle)
+            img_size: tuple,  # (height_px, width_px) in pixels
+            n_depth: int,  # number of samples along each ray
+            near: float,  # near plane (distance along view dir, in mm or RAS units)
+            far: float  # far plane (distance along view dir)
+    ) -> torch.Tensor:
+        """
+        Generate 3D sample coordinates in IJK space, cast as rays from camera through pixels in the image plane,
+        compatible with VTK conventions and an arbitrary RAS2IJK matrix.
+        Returns: Tensor of shape (H, W, n_depth, 3), the IJK coordinates along each ray.
+        """
+        start= timer()
+        device = view_mat.device if isinstance(view_mat, torch.Tensor) else "cpu"
+        vol_shape = torch.as_tensor(vol_shape, device=device)
+        H, W = img_size
+        D = n_depth
+        B = view_mat.shape[0]
+        ras2ijk = ras2ijk.to(device, dtype=torch.float32)
+
+        # World ray directions: rotate by camera orientation (camera-to-world 3x3)
+        cam2world = view_mat[..., :3, :3]
+        cam_pos = view_mat[..., :3, 3]
+
+        dirs_world = torch.einsum('bij,bhwj->bhwi', cam2world, self.dirs_cam.unsqueeze(0))
+
+        # Ray origin: all start at camera position
+        # ray_origins = cam_pos.reshape(-1, 1, 1, 3).expand(-1, H, W, -1)
+        ray_origins = cam_pos[:, None, None, None, :]  # (B,1,1,1,3)
+        R = ras2ijk[:3, :3]
+        t = ras2ijk[:3, 3]
+
+        ijk_coords = torch.empty(B, D, H, W, 3, device=device, dtype=torch.float32)
+
+        # Sample depths along ray (uniform, in world/RAS units)
+        depths = torch.linspace(near, far, D, device=device)
+        dirs_world = dirs_world.unsqueeze(1)
+
+        # Process depth in batches to reduce memory footprint
+        for start in range(0, D, 32):
+            end = min(start + 32, D)
+            depths_batch = depths[start:end]  # (d_batch,)
+            depths_batch = depths_batch.view(1, -1, 1, 1, 1)  # (1, d_batch, 1, 1, 1)
+
+            # Compute sample positions for this depth batch
+            # Broadcasting: ray_origins (B,H,W,3) + dirs_world (B,H,W,3) * depths_batch (1,d,H,W)
+            samples = ray_origins + dirs_world * depths_batch
+
+            # Apply RAS->IJK affine
+            ijk_batch = samples @ R.T + t  # (B,d,H,W,3)
+
+            # Normalize to [-1,1]
+            ijk_batch = ((2 * ijk_batch) / (vol_shape - 1)) - 1
+
+            # Store in output
+            ijk_coords[:, start:end] = ijk_batch
+
+        return ijk_coords  # (B,D,H,W,3)
+
+
+
     def get_camera_matrix(self, look_from):
         nu  = F.normalize(look_from)
         old = torch.tensor([0, 0, 1.0], dtype=nu.dtype, device=nu.device).expand(nu.size(0),-1)
@@ -224,13 +494,12 @@ class VolumeRaycaster(nn.Module):
         R[torch.isnan(R).sum(dim=(1,2)).bool()] = torch.flip(torch.eye(3, dtype=nu.dtype, device=nu.device), [0])
         return R
 
-    def forward(self, vol, view_mat=None, output_alpha=False, tile_size=16):
+    def forward(self, vol, view_mat, ras2ijk):
         ''' Renders a volume (with given view matrix) using raycasting.
         Args:
             vol (Tensor): Batch of volumes to render. Shape (BS, C, D, H, W). C=1 if `tf` is given.
             tf (Tensor): Transfer Function (to apply to `vol`) either as texture (BS, C, W) or as lists of points [(N, C+1)] (len of list must match BS). If this is None, an RGBo `vol` is expected (default).
             view_mat (Tensor or function): A (BS, 4, 4) transformation matrix representing the view matrix..
-            output_alpha (bool): Whether to output RGBA instead of RGB. Default is False
 
         Returns:
             Batch of raycast images of shape (BS, C, H, W)
@@ -242,74 +511,163 @@ class VolumeRaycaster(nn.Module):
         bs = density.size(0)
 
         # Expand and move samples to device
-        sample_coords = self.samples.expand(bs, -1, -1, -1, -1).to(device=vol.device, dtype=vol.dtype)
-        if view_mat is not None:
-            old_shape = sample_coords.shape
-            sample_coords = homogenize_vec(sample_coords.reshape(bs, -1, 3).permute(0, 2, 1))
-            sample_coords = torch.matmul(view_mat, sample_coords).permute(0, 2, 1)[..., :3].reshape(old_shape)
-            sample_coords *= 1.3
+        # sample_coords = self.samples.expand(bs, -1, -1, -1, -1).to(device=vol.device, dtype=vol.dtype)
+        # if view_mat is not None:
+        #     old_shape = sample_coords.shape
+        #     sample_coords = homogenize_vec(sample_coords.reshape(bs, -1, 3).permute(0, 2, 1))
+        #     sample_coords = torch.matmul(view_mat, sample_coords).permute(0, 2, 1)[..., :3].reshape(old_shape)
+        #     sample_coords *= 1.3
+        near = 700.0
+        far = 1300.0
+        sample_coords = self.generate_vtk_ray_samples_ijk(
+            vol.shape[2:],
+            ras2ijk,
+            view_mat,
+            fov_y_deg=20.0,
+            img_size=(self.h, self.w),
+            n_depth=self.ray_samples,
+            near=near,
+            far=far,
+        ).to(device=vol.device, dtype=vol.dtype)
 
         # Prepare output accumulation
         B, S, H, W, _ = sample_coords.shape
         out_rgb = []
-        out_alpha = []
+        step_size = 0.1 * (far - near) / self.ray_samples # step size in cm
 
         # Define a checkpointable per-tile function
         def tile_render_fn(density, coords_tile):
             dens_tile = F.grid_sample(density, coords_tile, align_corners=False)
-            dens_tile = self.density_factor * dens_tile / self.ray_samples
 
-            inv_dens = 1.0 - dens_tile
-            transmission = torch.cumprod(inv_dens, dim=2)
-            weight = dens_tile * transmission
-            w_sum = torch.sum(weight, dim=2)
-            render_tile = torch.sum(weight, dim=2) / (w_sum + 1e-6)
+            if self.use_beer_lambert:
+                if self.scatter:
+                    I_out_no_scatter = 1.0 - torch.exp(-torch.sum(dens_tile[:, :-self.scatter_channels] * step_size, dim=2))
+                    I_out, I_primary, scatter_map, alpha = self.scatter(dens_tile[:, -self.scatter_channels:], step_size)
+                    return torch.cat([I_out_no_scatter, 1.0-I_out], dim=1)
+                else:
+                    return 1.0 - torch.exp(-torch.sum(dens_tile * step_size, dim=2))
+            else:
+                dens_tile = self.density_factor * dens_tile / self.ray_samples
 
-            # color_tile = F.grid_sample(color, coords_tile, align_corners=False)
-            # render_tile = torch.sum(weight * color_tile, dim=2) / (w_sum + 1e-6)
-            alpha_tile = 1.0 - torch.prod(1 - dens_tile, dim=2)
-            render_tile = render_tile * alpha_tile
-            return render_tile, alpha_tile
+                inv_dens = 1.0 - dens_tile
+                transmission = torch.cumprod(inv_dens, dim=2)
+                weight = dens_tile * transmission
+                w_sum = torch.sum(weight, dim=2)
+                render_tile = torch.sum(weight, dim=2) / (w_sum + 1e-6)
 
-        # Chunk along H and checkpoint each tile
-        for h0 in range(0, H, tile_size):
-            h1 = min(h0 + tile_size, H)
-            coords_tile = sample_coords[:, :, h0:h1]  # (B, S, tile, W, 3)
+                # color_tile = F.grid_sample(color, coords_tile, align_corners=False)
+                # render_tile = torch.sum(weight * color_tile, dim=2) / (w_sum + 1e-6)
+                alpha_tile = 1.0 - torch.prod(1 - dens_tile, dim=2)
+                render_tile = render_tile * alpha_tile
+                return render_tile
 
+        # Chunk along batch and checkpoint each tile
+        for density_batch, coords_batch in zip(torch.chunk(density, B, dim=0), torch.chunk(sample_coords, B, dim=0)):
+            # for density_tile, coords_tile in zip(torch.chunk(density_batch, S, dim=1), torch.chunk(coords_batch, S, dim=1)):
             # Use checkpointing
             if self.use_checkpointing:
-                render_tile, alpha_tile = cp.checkpoint(tile_render_fn, density, coords_tile,
+                render_tile = cp.checkpoint(tile_render_fn, density_batch, coords_batch,
                                                         use_reentrant=False)
             else:
-                render_tile, alpha_tile = tile_render_fn(density, coords_tile)
+                render_tile = tile_render_fn(density_batch, coords_batch)
 
             out_rgb.append(render_tile)
-            out_alpha.append(alpha_tile)
 
-        render = torch.cat(out_rgb, dim=2)
-        if output_alpha:
-            alpha = torch.cat(out_alpha, dim=2)
-            return torch.cat([render, alpha], dim=1)
-        else:
-            return render
+        render = torch.cat(out_rgb, dim=0)
+        return render
 
 
 if __name__ == '__main__':
-    ren = VolumeRaycaster().cuda()
-    vol = torch.rand(8, 1, 128, 128, 128).cuda()
-    vol.requires_grad_(True)
-    view_mat = get_view_mat(torch.tensor([0, 0, 1.0])).cuda()
-    start = timer()
-    out = ren(vol, view_mat=view_mat, tile_size=64)
-    torch.cuda.synchronize()
-    end = timer()
-    print(out.shape, end-start)
+    from monai.transforms import LoadImage, EnsureType, EnsureChannelFirst, ScaleIntensity, Compose, Spacing, \
+    NormalizeIntensity, CenterSpatialCrop, RandAffine, ScaleIntensityRange
+    from matplotlib import pyplot as plt
 
-    start = timer()
-    out.sum().backward()
-    torch.cuda.synchronize()
-    end = timer()
-    print(end-start)
 
+    load_tf = Compose([
+        LoadImage(),
+        EnsureChannelFirst(),
+        Spacing([2.5, 2.5, 3.0]),
+        # CenterSpatialCrop([152,152,140]),
+        ScaleIntensityRange(-3024, 3024, 0, 1, clip=True),
+        EnsureType(),
+        # RandAffine(1, translate_range=((0, 0), (0, 0), (-15, 15)), padding_mode='zeros'),
+    ])
+    vol = load_tf('CTChest.nii.gz').unsqueeze(0)
+    # vol.requires_grad_(True)
+
+    tf = [torch.tensor([
+        [-3500, 1, 1, 1, 0.0],
+        [-200, 1, 1, 1, 0.0],
+        [200, 1, 1, 1, 0.05],
+        [1535, 1, 1, 1, 0.5],
+        [3071, 1, 1, 1, 0.65],
+    ]).cuda()]
+    tf[0][:, 0] = (tf[0][:, 0] + 3500) / 7000
+
+    xp = tf[0][:, 0]
+    yp = tf[0][:, -1]
+    a = piecewise_linear_channelwise(vol.cuda(), xp.unsqueeze(0), yp.unsqueeze(0))
+
+    hu = vol * (3024 - (-3524)) + (-3524)
+    mu = torch.clamp(0.07 * (1.0 + hu / 1000.0), min=0.0).cuda()
+
+    ijk2ras = vol.meta['affine']
+    ras2ijk = torch.inverse(ijk2ras)
+
+    print(ijk2ras, ras2ijk)
+
+    center = torch.ones(4).double()
+    center[:3] = torch.as_tensor(vol.shape[2:]) // 2
+    center = ijk2ras @ center
+    print(center[:3])
+
+    ren = VolumeRaycaster(use_checkpointing=False, ray_samples=128).cuda()
+    # vol = torch.rand(8, 1, 128, 128, 128).cuda()
+    # vol.requires_grad_(True)
+
+
+    view_mat = get_vtk_view_mat((0., 1000, -130.),
+                                center[:3],
+                                (0.0, 0.0, 1.), device='cuda').unsqueeze(0)
+
+    # view_mat = get_vtk_view_mat((825.512239409456, -13.179125178309306, -150.8782530984467),
+    #                             (0.7339149949892914, -69.45105638432082, -184.52283569821498),
+    #                             (-0.0018398770598324777, -0.0012575743709173355, 0.9999975166764699))
+    # print(view_mat.inverse())
+
+    view_mat = view_mat.repeat(1, 1, 1)
+
+    with torch.no_grad():
+        start = timer()
+        out = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
+        torch.cuda.synchronize()
+        end = timer()
+        print(out.shape, end-start)
+
+    # start = timer()
+    # out = ren(mu.expand(4, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
+    # torch.cuda.synchronize()
+    # end = timer()
+    # print(out.shape, end-start)
+
+
+    # start = timer()
+    # out.sum().backward()
+    # torch.cuda.synchronize()
+    # end = timer()
+    # print(end-start)
 
     print(torch.cuda.memory_summary())
+
+    plt.figure()
+    plt.imshow(out[0,0].detach().cpu().numpy(), cmap='gray')
+    plt.show()
+
+    plt.figure()
+    plt.imshow(out[0,-1].detach().cpu().numpy(), cmap='gray')
+    plt.show()
+
+    plt.figure()
+    plt.imshow(out[0,-1].detach().cpu().numpy() - out[0,0].detach().cpu().numpy(), cmap='gray')
+    plt.show()
+    print(torch.abs(out[0,-1] - out[0,0]).max())
