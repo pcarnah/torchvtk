@@ -122,6 +122,169 @@ def lookAt(look_from, look_up=None):
     return fmat
 
 
+def get_random_carm_views(n_views, sid_range, ap_range, lat_range, si_range, center):
+    """
+    Randomly sample C-arm view parameters.
+
+    Parameters:
+    -----------
+    sid_range : tuple of 2 floats
+        (min_sid, max_sid) in mm. Typical range: (900, 1200)
+    ap_range : tuple of 2 floats
+        (min_ap, max_ap) in degrees. Typical range: (-40, 40) for cranial/caudal
+    lat_range : tuple of 2 floats
+        (min_lat, max_lat) in degrees. Typical range: (-90, 90) for LAO/RAO
+    si_range : tuple of 2 floats
+        (min_si, max_si) in mm. Typical range: (-100, 100) for table translation
+
+    Returns:
+    --------
+    sid : float
+        Source-to-image distance in mm
+    ap_angle : float
+        AP angle in degrees
+    lat_angle : float
+        Lateral angle in degrees
+    table_si : float
+        Table superior-inferior translation in mm
+
+    Notes:
+    ------
+    Distribution choice rationale:
+    - SID: Uniform is appropriate - mechanical constraint, no preferred distance
+    - AP angle: Uniform is reasonable for training, though clinical use shows
+      bias toward AP (0°), cranial (15-30°), and steep cranial (>30°)
+    - Lateral angle: Uniform works, but clinical practice favors AP (0°),
+      RAO 30°, and LAO 30-45° views
+    - Table SI: Uniform is appropriate - depends on anatomy region of interest
+
+    For more realistic clinical distributions, consider:
+    - Adding bias toward common views (0°, ±30°, ±45°)
+    - Using a mixture of uniforms or peaked distributions
+    """
+    import random
+
+    views = []
+    for _ in range(n_views):
+        sid = random.uniform(sid_range[0], sid_range[1])
+        ap_angle = random.uniform(ap_range[0], ap_range[1])
+        lat_angle = random.uniform(lat_range[0], lat_range[1])
+        table_si = random.uniform(si_range[0], si_range[1])
+
+        pos, focal, up = carm_to_camera_params(sid, ap_angle, lat_angle, center, table_si)
+        views.append(get_vtk_view_mat(pos, focal, up))
+
+    views = torch.stack(views)
+
+    return views
+
+def carm_to_camera_params(sid, ap_angle, lat_angle, center_ras, table_si=0.0):
+    """
+    Convert C-arm position parameters to camera parameters.
+
+    Parameters:
+    -----------
+    sid : float
+        Source-to-Image Distance in mm (distance from X-ray source to detector)
+    ap_angle : float
+        Anteroposterior (AP) angle in degrees
+        - 0° = AP view (source in front, looking posterior)
+        - Positive = cranial angulation
+        - Negative = caudal angulation
+    lat_angle : float
+        Lateral angle in degrees
+        - 0° = AP view
+        - Positive = RAO (source moves to patient's right)
+        - Negative = LAO (source moves to patient's left)
+    center_ras : tuple or list of 3 floats
+        Center point of the CT scan in RAS coordinates (mm)
+        RAS = Right, Anterior, Superior
+    table_si : float, optional
+        Table translation in superior-inferior direction in mm (default: 0.0)
+        - Positive = table moves superior (head up)
+        - Negative = table moves inferior (head down)
+
+    Returns:
+    --------
+    cam_pos : numpy array (3,)
+        Camera/source position in RAS coordinates
+    look_at : numpy array (3,)
+        Look-at point (focal point) in RAS coordinates
+    look_up : numpy array (3,)
+        Up vector for camera orientation
+    """
+
+    # Convert angles to radians
+    ap_rad = np.deg2rad(ap_angle)
+    lat_rad = np.deg2rad(lat_angle)
+
+    # Center point with table translation
+    # Table moves in superior-inferior direction (Z-axis in RAS)
+    center = np.array(center_ras) + np.array([0, 0, table_si])
+
+    # Initial source position at SID distance along negative Y axis (anterior)
+    source_local = np.array([0, -sid, 0])
+
+    # Rotation around Z-axis (superior) for lateral angulation
+    R_lat = np.array([
+        [np.cos(lat_rad), -np.sin(lat_rad), 0],
+        [np.sin(lat_rad), np.cos(lat_rad), 0],
+        [0, 0, 1]
+    ])
+
+    # Rotation around X-axis (right) for cranial/caudal angulation
+    R_ap = np.array([
+        [1, 0, 0],
+        [0, np.cos(ap_rad), -np.sin(ap_rad)],
+        [0, np.sin(ap_rad), np.cos(ap_rad)]
+    ])
+
+    # Apply rotations: first lateral, then AP
+    R_total = R_ap @ R_lat
+    source_rotated = R_total @ source_local
+
+    # Camera position in world coordinates
+    cam_pos = source_rotated + center
+
+    # Look-at point is the center
+    look_at = center
+
+    # Up vector: start with superior direction and apply same rotations
+    up_local = np.array([0, 0, 1])
+    look_up = R_total @ up_local
+
+    return cam_pos, look_at, look_up
+
+def get_vtk_view_mat(cam_pos: Tuple[float],  # (3,) camera center in RAS
+                     cam_focal: Tuple[float],  # (3,) camera focal point in RAS
+                     cam_viewup: Tuple[float],  # (3,) view-up vector in RAS)
+                     device: str = 'cpu'):
+    cam_pos = torch.as_tensor(cam_pos, dtype=torch.float32)
+    cam_focal = torch.as_tensor(cam_focal, dtype=torch.float32)
+    cam_viewup = torch.as_tensor(cam_viewup, dtype=torch.float32)
+
+    # Construct VTK-compatible camera axes
+    forward = torch.nn.functional.normalize(cam_focal - cam_pos, dim=0)  # +Z axis (direction of projection in VTK)
+    right = torch.nn.functional.normalize(torch.linalg.cross(forward, cam_viewup), dim=0)
+    up = torch.linalg.cross(right, forward)  # True up direction
+
+    # VTK Camera: camera is at cam_pos, looking at cam_focal, with 'up' vector cam_viewup
+    # Form rotation (world-to-camera) matrix
+    rot = torch.stack([right, up, -forward], dim=1)  # camera convention: X=right, Y=up, Z=backward
+    trans = -rot.T @ cam_pos  # translation to position the camera at cam_pos
+
+    # View matrix (world-to-camera)
+    view_mat = torch.zeros(4, 4, device=device)
+    view_mat[:3, 0] = right
+    view_mat[:3, 1] = up
+    view_mat[:3, 2] = -forward  # Negative for right-handed system
+    view_mat[:3, 3] = cam_pos
+    view_mat[3, 3] = 1.0
+
+    return view_mat
+
+
+
 def get_vtk_view_mat(cam_pos: Tuple[float],  # (3,) camera center in RAS
                      cam_focal: Tuple[float],  # (3,) camera focal point in RAS
                      cam_viewup: Tuple[float],  # (3,) view-up vector in RAS)
@@ -335,7 +498,6 @@ class VolumeRaycaster(nn.Module):
         self.use_checkpointing = use_checkpointing
         self.use_beer_lambert = use_beer_lambert
         self.scatter = None
-
         if isinstance(resolution, tuple):
               self.w, self.h = resolution
         else: self.w, self.h = resolution, resolution
@@ -355,7 +517,6 @@ class VolumeRaycaster(nn.Module):
         if scatter is not None:
             self.scatter_channels = scatter
             self.scatter = DepthAwareScatter(scatter)
-
 
         # Vertical FOV in radians
         fov_y = np.deg2rad(20.0)
@@ -417,6 +578,174 @@ class VolumeRaycaster(nn.Module):
                                  torch.linspace(-1, 1, self.w))
         samples = torch.stack([x,y,z, torch.ones_like(x)], dim=-1).expand(bs,-1,-1,-1,-1)
         samples_poses = torch.bmm(samples.reshape(bs, -1, 4), inv_tfm).reshape(bs, self.ray_samples, self.h, self.w, 4)
+
+    @staticmethod
+    def compute_clipping_distances(camera_matrix, volume_shape, ijk2ras, margin=30.0):
+        """
+        Compute near and far clipping distances for ray sampling based on camera matrix
+        and volume bounds in IJK space.
+
+        Parameters:
+        -----------
+        camera_matrix : torch.Tensor (B, 4, 4) or (4, 4)
+            Batched or single 4x4 camera view matrix in RAS space
+            Can be world-to-camera or camera-to-world (will be auto-detected)
+        volume_shape : tuple of 3 ints
+            Volume dimensions in IJK space (I, J, K)
+        ijk2ras : torch.Tensor (4, 4)
+            Transformation matrix from IJK to RAS coordinates
+        margin : float, optional
+            Safety margin to add to near/far distances in mm (default: 0.0)
+            Positive values expand the clipping range
+
+        Returns:
+        --------
+        near : torch.Tensor (B,) or float
+            Near clipping distance in mm (distance from camera to closest volume point)
+        far : torch.Tensor (B,) or float
+            Far clipping distance in mm (distance from camera to farthest volume point)
+        """
+
+        if not isinstance(camera_matrix, torch.Tensor):
+            camera_matrix = torch.tensor(camera_matrix, dtype=torch.float32)
+        if not isinstance(ijk2ras, torch.Tensor):
+            ijk2ras = torch.tensor(ijk2ras, dtype=torch.float32)
+
+
+        # Handle both batched and single camera matrices
+        is_batched = camera_matrix.ndim == 3
+        if not is_batched:
+            camera_matrix = camera_matrix.unsqueeze(0)
+
+        batch_size = camera_matrix.shape[0]
+        device = camera_matrix.device
+
+        ijk2ras = ijk2ras.to(dtype=camera_matrix.dtype, device=device)
+
+        # Extract camera position from matrix
+        # Check if this is camera-to-world (large translation) or world-to-camera (small translation)
+        test_pos = camera_matrix[:, :3, 3]  # (B, 3)
+        translation_norm = torch.norm(test_pos, dim=1)  # (B,)
+
+        # For matrices with small translation, assume world-to-camera and invert
+        needs_invert = translation_norm < 1.0
+
+        cam_pos_ras = torch.zeros(batch_size, 3, device=device)
+        view_dir = torch.zeros(batch_size, 3, device=device)
+
+        for i in range(batch_size):
+            if needs_invert[i]:
+                cam_to_world = torch.inverse(camera_matrix[i])
+                cam_pos_ras[i] = cam_to_world[:3, 3]
+                view_dir[i] = -cam_to_world[:3, 2]
+            else:
+                cam_pos_ras[i] = camera_matrix[i, :3, 3]
+                view_dir[i] = -camera_matrix[i, :3, 2]
+
+        # Normalize view directions
+        view_dir = view_dir / torch.norm(view_dir, dim=1, keepdim=True)
+
+        # Generate all 8 corners of the volume bounding box in IJK space
+        I, J, K = volume_shape
+        corners_ijk = torch.tensor([
+            [0, 0, 0],
+            [I - 1, 0, 0],
+            [0, J - 1, 0],
+            [I - 1, J - 1, 0],
+            [0, 0, K - 1],
+            [I - 1, 0, K - 1],
+            [0, J - 1, K - 1],
+            [I - 1, J - 1, K - 1]
+        ], dtype=torch.float32, device=device)  # (8, 3)
+
+        # Transform corners to RAS space
+        corners_homog = torch.cat([corners_ijk, torch.ones(8, 1, device=device)], dim=1)  # (8, 4)
+        corners_ras = (ijk2ras @ corners_homog.T).T[:, :3]  # (8, 3)
+
+        # Compute distances from camera to each corner projected along view direction
+        # Broadcast: cam_pos_ras (B, 1, 3), corners_ras (1, 8, 3)
+        to_corners = corners_ras.unsqueeze(0) - cam_pos_ras.unsqueeze(1)  # (B, 8, 3)
+        distances = torch.sum(to_corners * view_dir.unsqueeze(1), dim=2)  # (B, 8)
+
+        # Near is the minimum distance, far is the maximum distance
+        near = torch.min(distances, dim=1).values - margin  # (B,)
+        far = torch.max(distances, dim=1).values + margin  # (B,)
+
+        # Ensure near is positive
+        near = torch.clamp(near, min=0.1)
+
+        # Return scalar if input was not batched
+        if not is_batched:
+            return near.item(), far.item()
+
+        return near, far
+
+    def generate_vtk_ray_samples_ijk(self,
+            vol_shape,  # (W, H, D) volume shape in voxels
+            ras2ijk: torch.Tensor,  # 4x4 RAS to IJK transform
+            view_mat: torch.Tensor,
+            fov_y_deg: float,  # vertical FOV in degrees (VTK's ViewAngle)
+            img_size: tuple,  # (height_px, width_px) in pixels
+            n_depth: int,  # number of samples along each ray
+            near: float,  # near plane (distance along view dir, in mm or RAS units)
+            far: float  # far plane (distance along view dir)
+    ) -> torch.Tensor:
+        """
+        Generate 3D sample coordinates in IJK space, cast as rays from camera through pixels in the image plane,
+        compatible with VTK conventions and an arbitrary RAS2IJK matrix.
+        Returns: Tensor of shape (H, W, n_depth, 3), the IJK coordinates along each ray.
+        """
+        start= timer()
+        device = view_mat.device if isinstance(view_mat, torch.Tensor) else "cpu"
+        vol_shape = torch.as_tensor(vol_shape, device=device)
+        H, W = img_size
+        D = n_depth
+        B = view_mat.shape[0]
+        ras2ijk = ras2ijk.to(device, dtype=torch.float32)
+
+        # World ray directions: rotate by camera orientation (camera-to-world 3x3)
+        cam2world = view_mat[..., :3, :3]
+        cam_pos = view_mat[..., :3, 3]
+
+        dirs_world = torch.einsum('bij,bhwj->bhwi', cam2world, self.dirs_cam.unsqueeze(0))
+
+        # Ray origin: all start at camera position
+        # ray_origins = cam_pos.reshape(-1, 1, 1, 3).expand(-1, H, W, -1)
+        ray_origins = cam_pos[:, None, None, None, :]  # (B,1,1,1,3)
+        R = ras2ijk[:3, :3]
+        t = ras2ijk[:3, 3]
+
+        ijk_coords = torch.empty(B, D, H, W, 3, device=device, dtype=torch.float32)
+
+        # Sample depths along ray (uniform, in world/RAS units)
+        depths = near.unsqueeze(1) + (far - near).unsqueeze(1) * torch.linspace(
+            0, 1, D, device=device
+        ).unsqueeze(0)  # (B, D)
+        # depths = torch.linspace(near, far, D, device=device)
+        dirs_world = dirs_world.unsqueeze(1)
+
+        # Process depth in batches to reduce memory footprint
+        for start in range(0, D, 32):
+            end = min(start + 32, D)
+            depths_batch = depths[:, start:end]  # (d_batch,)
+            depths_batch = depths_batch.view(B, -1, 1, 1, 1)  # (1, d_batch, 1, 1, 1)
+
+            # Compute sample positions for this depth batch
+            # Broadcasting: ray_origins (B,H,W,3) + dirs_world (B,H,W,3) * depths_batch (1,d,H,W)
+            samples = ray_origins + dirs_world * depths_batch
+
+            # Apply RAS->IJK affine
+            ijk_batch = samples @ R.T + t  # (B,d,H,W,3)
+
+            # Normalize to [-1,1]
+            ijk_batch = ((2 * ijk_batch) / (vol_shape - 1)) - 1
+
+            # Store in output
+            ijk_coords[:, start:end] = ijk_batch
+
+        return ijk_coords  # (B,D,H,W,3)
+
+
 
 
     def generate_vtk_ray_samples_ijk(self,
@@ -509,6 +838,29 @@ class VolumeRaycaster(nn.Module):
      #    color   = vol[:, :-1 ].permute(0, 1, 4, 3, 2).contiguous()  # (B, C-1, W, H, D)
         density = vol.permute(0, 1, 4, 3, 2).contiguous()  # (B, C, W, H, D)
         bs = density.size(0)
+        N = view_mat.shape[0]
+
+        if N < bs:
+            raise ValueError(
+                f"Number of view matrices ({N}) cannot be less than "
+                f"batch size ({bs}) unless N=1"
+            )
+        elif N == 1:
+            # Single view for all volumes - expand view
+            view_mat = view_mat.expand(bs, -1, -1)
+        elif N > bs:
+            if N % bs != 0:
+                raise ValueError(
+                    f"Number of view matrices ({N}) must be a multiple of "
+                    f"batch size ({bs}) when N > BS"
+                )
+            views_per_vol = N // bs
+
+            # Repeat each volume for its corresponding views
+            # vol[0] -> view[0:views_per_vol]
+            # vol[1] -> view[views_per_vol:2*views_per_vol]
+            # etc.
+            density = torch.repeat_interleave(density, views_per_vol, dim=0)
 
         # Expand and move samples to device
         # sample_coords = self.samples.expand(bs, -1, -1, -1, -1).to(device=vol.device, dtype=vol.dtype)
@@ -517,8 +869,10 @@ class VolumeRaycaster(nn.Module):
         #     sample_coords = homogenize_vec(sample_coords.reshape(bs, -1, 3).permute(0, 2, 1))
         #     sample_coords = torch.matmul(view_mat, sample_coords).permute(0, 2, 1)[..., :3].reshape(old_shape)
         #     sample_coords *= 1.3
-        near = 700.0
-        far = 1300.0
+        # near = 700.0
+        # far = 1300.0
+        near, far = self.compute_clipping_distances(view_mat, vol.shape[2:], torch.inverse(ras2ijk))
+
         sample_coords = self.generate_vtk_ray_samples_ijk(
             vol.shape[2:],
             ras2ijk,
@@ -536,16 +890,16 @@ class VolumeRaycaster(nn.Module):
         step_size = 0.1 * (far - near) / self.ray_samples # step size in cm
 
         # Define a checkpointable per-tile function
-        def tile_render_fn(density, coords_tile):
+        def tile_render_fn(density, coords_tile, step_batch):
             dens_tile = F.grid_sample(density, coords_tile, align_corners=False)
 
             if self.use_beer_lambert:
                 if self.scatter:
-                    I_out_no_scatter = 1.0 - torch.exp(-torch.sum(dens_tile[:, :-self.scatter_channels] * step_size, dim=2))
-                    I_out, I_primary, scatter_map, alpha = self.scatter(dens_tile[:, -self.scatter_channels:], step_size)
+                    I_out_no_scatter = 1.0 - torch.exp(-torch.sum(dens_tile[:, :-self.scatter_channels] * step_batch, dim=2))
+                    I_out, I_primary, scatter_map, alpha = self.scatter(dens_tile[:, -self.scatter_channels:], step_batch)
                     return torch.cat([I_out_no_scatter, 1.0-I_out], dim=1)
                 else:
-                    return 1.0 - torch.exp(-torch.sum(dens_tile * step_size, dim=2))
+                    return 1.0 - torch.exp(-torch.sum(dens_tile * step_batch, dim=2))
             else:
                 dens_tile = self.density_factor * dens_tile / self.ray_samples
 
@@ -562,14 +916,14 @@ class VolumeRaycaster(nn.Module):
                 return render_tile
 
         # Chunk along batch and checkpoint each tile
-        for density_batch, coords_batch in zip(torch.chunk(density, B, dim=0), torch.chunk(sample_coords, B, dim=0)):
+        for density_batch, coords_batch, step_batch in zip(torch.chunk(density, B, dim=0), torch.chunk(sample_coords, B, dim=0), step_size):
             # for density_tile, coords_tile in zip(torch.chunk(density_batch, S, dim=1), torch.chunk(coords_batch, S, dim=1)):
             # Use checkpointing
             if self.use_checkpointing:
-                render_tile = cp.checkpoint(tile_render_fn, density_batch, coords_batch,
+                render_tile = cp.checkpoint(tile_render_fn, density_batch, coords_batch, step_batch,
                                                         use_reentrant=False)
             else:
-                render_tile = tile_render_fn(density_batch, coords_batch)
+                render_tile = tile_render_fn(density_batch, coords_batch, step_batch)
 
             out_rgb.append(render_tile)
 
@@ -621,7 +975,7 @@ if __name__ == '__main__':
     center = ijk2ras @ center
     print(center[:3])
 
-    ren = VolumeRaycaster(use_checkpointing=False, ray_samples=128).cuda()
+    ren = VolumeRaycaster(scatter=None).cuda()
     # vol = torch.rand(8, 1, 128, 128, 128).cuda()
     # vol.requires_grad_(True)
 
@@ -635,20 +989,19 @@ if __name__ == '__main__':
     #                             (-0.0018398770598324777, -0.0012575743709173355, 0.9999975166764699))
     # print(view_mat.inverse())
 
-    view_mat = view_mat.repeat(1, 1, 1)
+    view_mat = view_mat.repeat(4, 1, 1)
 
-    with torch.no_grad():
-        start = timer()
-        out = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
-        torch.cuda.synchronize()
-        end = timer()
-        print(out.shape, end-start)
+    start = timer()
+    out = ren(mu.expand(4, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
+    torch.cuda.synchronize()
+    end = timer()
+    print(out.shape, end-start)
 
-    # start = timer()
-    # out = ren(mu.expand(4, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
-    # torch.cuda.synchronize()
-    # end = timer()
-    # print(out.shape, end-start)
+    start = timer()
+    out = ren(mu.expand(4, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
+    torch.cuda.synchronize()
+    end = timer()
+    print(out.shape, end-start)
 
 
     # start = timer()
