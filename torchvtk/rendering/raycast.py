@@ -484,6 +484,7 @@ class VolumeRaycaster(nn.Module):
             use_checkpointing: bool = False,
             use_beer_lambert: bool = True,
             scatter: Optional[int] = None,  # or int | None if Python 3.10+
+            i0: Optional[float] = None,
     ) -> None:
         ''' Initializes differentiable raycasting layer
 
@@ -498,6 +499,7 @@ class VolumeRaycaster(nn.Module):
         self.use_checkpointing = use_checkpointing
         self.use_beer_lambert = use_beer_lambert
         self.scatter = None
+        self.i0 = i0
         if isinstance(resolution, tuple):
               self.w, self.h = resolution
         else: self.w, self.h = resolution, resolution
@@ -757,6 +759,18 @@ class VolumeRaycaster(nn.Module):
         R[torch.isnan(R).sum(dim=(1,2)).bool()] = torch.flip(torch.eye(3, dtype=nu.dtype, device=nu.device), [0])
         return R
 
+    def apply_poisson(self, transmission: torch.Tensor) -> torch.Tensor:
+        if self.i0 is None:
+            return transmission
+
+        # Differentiable Gaussian approximation of Poisson
+        transmission = torch.clamp(transmission, min=1e-8)
+        std = torch.sqrt(transmission / self.i0)
+        epsilon = torch.randn_like(transmission)
+        noisy_transmission = transmission + std * epsilon
+        return torch.clamp(noisy_transmission, 0, 1)
+
+
     def forward(self, vol, view_mat, ras2ijk):
         ''' Renders a volume (with given view matrix) using raycasting.
         Args:
@@ -828,12 +842,13 @@ class VolumeRaycaster(nn.Module):
             dens_tile = F.grid_sample(density, coords_tile, align_corners=False)
 
             if self.use_beer_lambert:
+                # Return absorption (1-T) for X-ray visualization convention (bone = white)
                 if self.scatter:
-                    I_out_no_scatter = 1.0 - torch.exp(-torch.sum(dens_tile[:, :-self.scatter_channels] * step_batch, dim=2))
+                    I_out_no_scatter = 1.0 - self.apply_poisson(torch.exp(-torch.sum(dens_tile[:, :-self.scatter_channels] * step_batch, dim=2)))
                     I_out, I_primary, scatter_map, alpha = self.scatter(dens_tile[:, -self.scatter_channels:], step_batch)
                     return torch.cat([I_out_no_scatter, 1.0-I_out], dim=1)
                 else:
-                    return 1.0 - torch.exp(-torch.sum(dens_tile * step_batch, dim=2))
+                    return 1.0 - self.apply_poisson(torch.exp(-torch.sum(dens_tile * step_batch, dim=2)))
             else:
                 dens_tile = self.density_factor * dens_tile / self.ray_samples
 
