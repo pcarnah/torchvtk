@@ -485,6 +485,7 @@ class VolumeRaycaster(nn.Module):
             use_beer_lambert: bool = True,
             scatter: Optional[int] = None,  # or int | None if Python 3.10+
             i0: Optional[float] = None,
+            fov: Optional[float] = 20.0
     ) -> None:
         ''' Initializes differentiable raycasting layer
 
@@ -521,7 +522,7 @@ class VolumeRaycaster(nn.Module):
             self.scatter = DepthAwareScatter(scatter)
 
         # Vertical FOV in radians
-        fov_y = np.deg2rad(20.0)
+        fov_y = np.deg2rad(fov)
         aspect = self.w / self.h
         # Compute direction vectors in camera coordinates
         px = x * np.tan(fov_y / 2) * aspect
@@ -911,8 +912,9 @@ if __name__ == '__main__':
     yp = tf[0][:, -1]
     a = piecewise_linear_channelwise(vol.cuda(), xp.unsqueeze(0), yp.unsqueeze(0))
 
+    vol = vol.cuda()
     hu = vol * (3024 - (-3524)) + (-3524)
-    mu = torch.clamp(0.07 * (1.0 + hu / 1000.0), min=0.0).cuda()
+    mu = torch.clamp(0.05 * (1.0 + hu / 800.0), min=0.0)
 
     ijk2ras = vol.meta['affine']
     ras2ijk = torch.inverse(ijk2ras)
@@ -924,7 +926,7 @@ if __name__ == '__main__':
     center = ijk2ras @ center
     print(center[:3])
 
-    ren = VolumeRaycaster(scatter=None).cuda()
+    ren = VolumeRaycaster(scatter=None, i0=1e4).cuda()
     # vol = torch.rand(8, 1, 128, 128, 128).cuda()
     # vol.requires_grad_(True)
 
