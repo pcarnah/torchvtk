@@ -255,34 +255,6 @@ def carm_to_camera_params(sid, ap_angle, lat_angle, center_ras, table_si=0.0):
 
     return cam_pos, look_at, look_up
 
-def get_vtk_view_mat(cam_pos: Tuple[float],  # (3,) camera center in RAS
-                     cam_focal: Tuple[float],  # (3,) camera focal point in RAS
-                     cam_viewup: Tuple[float],  # (3,) view-up vector in RAS)
-                     device: str = 'cpu'):
-    cam_pos = torch.as_tensor(cam_pos, dtype=torch.float32)
-    cam_focal = torch.as_tensor(cam_focal, dtype=torch.float32)
-    cam_viewup = torch.as_tensor(cam_viewup, dtype=torch.float32)
-
-    # Construct VTK-compatible camera axes
-    forward = torch.nn.functional.normalize(cam_focal - cam_pos, dim=0)  # +Z axis (direction of projection in VTK)
-    right = torch.nn.functional.normalize(torch.linalg.cross(forward, cam_viewup), dim=0)
-    up = torch.linalg.cross(right, forward)  # True up direction
-
-    # VTK Camera: camera is at cam_pos, looking at cam_focal, with 'up' vector cam_viewup
-    # Form rotation (world-to-camera) matrix
-    rot = torch.stack([right, up, -forward], dim=1)  # camera convention: X=right, Y=up, Z=backward
-    trans = -rot.T @ cam_pos  # translation to position the camera at cam_pos
-
-    # View matrix (world-to-camera)
-    view_mat = torch.zeros(4, 4, device=device)
-    view_mat[:3, 0] = right
-    view_mat[:3, 1] = up
-    view_mat[:3, 2] = -forward  # Negative for right-handed system
-    view_mat[:3, 3] = cam_pos
-    view_mat[3, 3] = 1.0
-
-    return view_mat
-
 
 
 def get_vtk_view_mat(cam_pos: Tuple[float],  # (3,) camera center in RAS
@@ -298,16 +270,11 @@ def get_vtk_view_mat(cam_pos: Tuple[float],  # (3,) camera center in RAS
     right = torch.nn.functional.normalize(torch.linalg.cross(forward, cam_viewup), dim=0)
     up = torch.linalg.cross(right, forward)  # True up direction
 
-    # VTK Camera: camera is at cam_pos, looking at cam_focal, with 'up' vector cam_viewup
-    # Form rotation (world-to-camera) matrix
-    rot = torch.stack([right, up, -forward], dim=1)  # camera convention: X=right, Y=up, Z=backward
-    trans = -rot.T @ cam_pos  # translation to position the camera at cam_pos
-
-    # View matrix (world-to-camera)
+    # View matrix (camera-to-world)
     view_mat = torch.zeros(4, 4, device=device)
     view_mat[:3, 0] = right
     view_mat[:3, 1] = up
-    view_mat[:3, 2] = -forward  # Negative for right-handed system
+    view_mat[:3, 2] = forward 
     view_mat[:3, 3] = cam_pos
     view_mat[3, 3] = 1.0
 
@@ -509,17 +476,25 @@ class VolumeRaycaster(nn.Module):
         # W = torch.linspace(-1, 1, self.w)
         # H = torch.linspace(-1, 1, self.h)
         # self.samples = self.get_coord_grid(Z, H, W, perspective=True)
+        self.register_buffer('dirs_cam', torch.empty(self.h, self.w, 3))
 
-        # Build image grid in normalized device coordinates (NDC): x:[-1,1], y:[-1,1] (centered at pixels)
+
+        if scatter is not None:
+            self.scatter_channels = scatter
+            self.scatter = DepthAwareScatter(scatter)
+
+        self.set_fov(fov)
+
+    def set_fov(self, fov: float) -> None:
+        # Get the current device from the buffer
+        device = self.dirs_cam.device
+
+        # Do computation on CPU
         y, x = torch.meshgrid(
             torch.linspace(-1, 1, self.h),  # vertical: -1 (bottom) to 1 (top)
             torch.linspace(-1, 1, self.w),  # horizontal: -1 (left) to 1 (right)
             indexing='ij'
         )
-
-        if scatter is not None:
-            self.scatter_channels = scatter
-            self.scatter = DepthAwareScatter(scatter)
 
         # Vertical FOV in radians
         fov_y = np.deg2rad(fov)
@@ -528,13 +503,11 @@ class VolumeRaycaster(nn.Module):
         px = x * np.tan(fov_y / 2) * aspect
         py = y * np.tan(fov_y / 2)
         pz = torch.ones_like(px)
-        dirs_cam = torch.stack([px, -py, -pz], dim=-1)  # shape: (H, W, 3)
+        dirs_cam = torch.stack([px, -py, pz], dim=-1)  # shape: (H, W, 3)
 
-
-        # Normalize directions
-        # dirs_cam = dirs_cam / torch.norm(dirs_cam, dim=-1, keepdim=True).unsqueeze(0)
-        dirs_cam = F.normalize(dirs_cam, dim=-1)
-        self.register_buffer('dirs_cam', dirs_cam)
+        # Normalize directions and move to device once at the end
+        dirs_cam = F.normalize(dirs_cam, dim=-1).to(device)
+        self.dirs_cam = dirs_cam
 
     def get_coord_grid(self, z, y, x, perspective=False, fovy=0.20, ar=1.0):
         ''' Computes the samples given linspaces of the correct sizes for each spatial dimension. '''
@@ -640,10 +613,10 @@ class VolumeRaycaster(nn.Module):
             if needs_invert[i]:
                 cam_to_world = torch.inverse(camera_matrix[i])
                 cam_pos_ras[i] = cam_to_world[:3, 3]
-                view_dir[i] = -cam_to_world[:3, 2]
+                view_dir[i] = cam_to_world[:3, 2]
             else:
                 cam_pos_ras[i] = camera_matrix[i, :3, 3]
-                view_dir[i] = -camera_matrix[i, :3, 2]
+                view_dir[i] = camera_matrix[i, :3, 2]
 
         # Normalize view directions
         view_dir = view_dir / torch.norm(view_dir, dim=1, keepdim=True)
@@ -681,6 +654,7 @@ class VolumeRaycaster(nn.Module):
         if not is_batched:
             return near.item(), far.item()
 
+        print(near,far)
         return near, far
 
     def generate_vtk_ray_samples_ijk(self,
