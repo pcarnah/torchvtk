@@ -476,7 +476,7 @@ class VolumeRaycaster(nn.Module):
         # W = torch.linspace(-1, 1, self.w)
         # H = torch.linspace(-1, 1, self.h)
         # self.samples = self.get_coord_grid(Z, H, W, perspective=True)
-        self.register_buffer('dirs_cam', torch.empty(self.h, self.w, 3))
+        self.register_buffer('dirs_cam', torch.empty(self.h, self.w, 3), persistent=False)
 
 
         if scatter is not None:
