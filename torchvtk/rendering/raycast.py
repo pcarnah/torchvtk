@@ -744,324 +744,156 @@ class VolumeRaycaster(nn.Module):
         noisy_transmission = transmission + std * epsilon
         return torch.clamp(noisy_transmission, 0, 1)
 
-    def forward(self, vol, view_mat, ras2ijk, tile_h=256, tile_w=256):
-        """Renders a volume with adaptive memory optimization based on training mode."""
-        
-        # Use tiling only in eval mode or when explicitly needed
-        use_tiling = not self.training and (self.h >= 2 * tile_h or self.w >= 2 * tile_w)
-
-        bs = vol.size(0)
-        N = view_mat.shape[0]
-
-        tiles = (tile_h, tile_w) if use_tiling else None
-
-        # Handle view matrix dimensions
-        if N < bs:
-            raise ValueError(
-                f"Number of view matrices ({N}) cannot be less than "
-                f"batch size ({bs}) unless N=1"
-            )
-        elif N == 1:
-            # Single view for all volumes - expand view
-            view_mat = view_mat.expand(bs, -1, -1)
-        elif N > bs:
-            if N % bs != 0:
-                raise ValueError(
-                    f"Number of view matrices ({N}) must be a multiple of "
-                    f"batch size ({bs}) when N > BS"
-                )
-            # Process views sequentially to avoid expanding density
-            return self._forward_multi_view(vol, view_mat, ras2ijk, tiles)
-
-        if use_tiling:
-            return self._forward_tiled(vol, view_mat, ras2ijk, tile_h, tile_w)
-        else:
-            return self._forward_standard(vol, view_mat, ras2ijk)
-
-    def _forward_tiled(self, vol, view_mat, ras2ijk, tile_h=256, tile_w=256):
-        """Renders a volume (with given view matrix) using raycasting with memory optimization.
-        
-        Args:
-            vol (Tensor): Batch of volumes to render. Shape (BS, C, D, H, W). C=1 if `tf` is given.
-            view_mat (Tensor or function): A (BS, 4, 4) transformation matrix representing the view matrix.
-            ras2ijk (Tensor): RAS to IJK transformation matrix.
-            tile_h (int): Tile height for spatial chunking (default: 256)
-            tile_w (int): Tile width for spatial chunking (default: 256)
-
-        Returns:
-            Batch of raycast images of shape (BS, C, H, W)
+    def forward(self, vol: torch.Tensor, view_mat: torch.Tensor, ras2ijk: torch.Tensor,
+                tile_h: int = 256, tile_w: int = 256) -> torch.Tensor:
         """
-        bs = vol.size(0)
+        Args:
+            vol:      (B, C, D, H, W)
+            view_mat: (B, 4, 4) or (N, 4, 4) where N = B * views_per_vol
+            ras2ijk:  (4, 4)
+        Returns:
+            (N, C, H, W)
+        """
+        bs = vol.shape[0]
         N = view_mat.shape[0]
 
-        # Handle view matrix dimensions
         if N < bs:
-            raise ValueError(
-                f"Number of view matrices ({N}) cannot be less than "
-                f"batch size ({bs}) unless N=1"
-            )
-        elif N == 1:
-            # Single view for all volumes - expand view
+            raise ValueError(f"view_mat has {N} entries but batch size is {bs}")
+        if N > bs and N % bs != 0:
+            raise ValueError(f"N ({N}) must be a multiple of batch size ({bs})")
+
+        # Expand density to match number of views
+        views_per_vol = N // bs
+        density = vol.permute(0, 1, 4, 3, 2)  # (B, C, W, H, D)
+        if views_per_vol > 1:
+            density = density.repeat_interleave(views_per_vol, dim=0)  # (N, C, W, H, D)
+        # N==1 broadcast: expand view_mat to bs
+        if N == 1:
             view_mat = view_mat.expand(bs, -1, -1)
-        elif N > bs:
-            if N % bs != 0:
-                raise ValueError(
-                    f"Number of view matrices ({N}) must be a multiple of "
-                    f"batch size ({bs}) when N > BS"
-                )
-            # Process views sequentially to avoid expanding density
-            return self._forward_multi_view(vol, view_mat, ras2ijk, tile_h, tile_w)
 
-        density = vol.permute(0, 1, 4, 3, 2).contiguous()  # (B, C, W, H, D)
-
-        # Compute clipping distances
         near, far = self.compute_clipping_distances(view_mat, vol.shape[2:], torch.inverse(ras2ijk))
-        step_size = 0.1 * (far - near) / self.ray_samples  # step size in cm
-        
-        # Define memory-efficient tile rendering function
-        def tile_render_fn(density_batch, coords_tile, step_batch):
-            dens_tile = F.grid_sample(density_batch, coords_tile, align_corners=False)
-            
+
+        use_tiling = self.h >= 2 * tile_h or self.w >= 2 * tile_w
+        _tile_h = tile_h if use_tiling else None
+        _tile_w = tile_w if use_tiling else None
+
+        vol_shape = torch.as_tensor(vol.shape[2:], device=vol.device, dtype=torch.float32)
+
+        render_fn = torch.vmap(
+            lambda d, v, n, f: self._render_single(d, v, n, f, ras2ijk, vol_shape, _tile_h, _tile_w),
+            in_dims=(0, 0, 0, 0),
+            randomness='different',  # required if apply_poisson uses torch.randn_like
+        )
+
+        return render_fn(density.contiguous(), view_mat, near, far)  # (N, C, H, W)
+
+    def _render_single(
+            self,
+            density: torch.Tensor,  # (C, W, H, D) — single volume, vmapped over batch
+            view_single: torch.Tensor,  # (4, 4)
+            near: torch.Tensor,  # scalar
+            far: torch.Tensor,  # scalar
+            ras2ijk: torch.Tensor,  # (4, 4) shared constant
+            vol_shape: torch.Tensor,  # (3,) shared constant
+            tile_h: int,
+            tile_w: int,
+    ) -> torch.Tensor:
+        """Render a single (volume, view) pair. Vmapped over batch dim.
+        Returns (C, H, W).
+        """
+        # density = density.contiguous()
+
+        step_size = 0.1 * (far - near) / self.ray_samples
+
+        # --- Ray generation (no loop, no B dim) ---
+        cam2world = view_single[:3, :3]
+        cam_pos = view_single[:3, 3]
+
+        device = view_single.device if isinstance(view_single, torch.Tensor) else "cpu"
+        ras2ijk = ras2ijk.to(device, dtype=torch.float32)
+
+        dirs_world = torch.einsum('ij,hwj->hwi', cam2world, self.dirs_cam)  # (H, W, 3)
+
+        R = ras2ijk[:3, :3]
+        t = ras2ijk[:3, 3]
+
+        scale = 2.0 / (vol_shape - 1)  # (3,)
+
+        dirs_ijk = dirs_world @ R.T  # (H, W, 3) @ (3, 3) — small, not (D,H,W,3)
+        origin_ijk = cam_pos @ R.T + t  # (3,) — scalar op
+
+        depths = near + (far - near) * torch.linspace(0, 1, self.ray_samples, device=density.device)  # (D,)
+
+        ijk = scale * (origin_ijk + dirs_ijk.unsqueeze(0) * depths[:, None, None, None]) - 1
+
+        # (D, H, W, 3) — no loop, fits in memory per-item
+        # samples = cam_pos + dirs_world.unsqueeze(0) * depths[:, None, None, None]
+        # ijk = ((2 * (samples @ R.T + t)) / (vol_shape - 1)) - 1  # (D, H, W, 3)
+
+        # grid_sample expects (C, W, H, D) input and (1, D, H, W, 3) grid
+        density_b = density.unsqueeze(0)  # (1, C, W, H, D)
+
+        def render_tile(coords_tile):
+            # coords_tile: (1, D, h, w, 3)
+            dens_tile = F.grid_sample(density_b, coords_tile, align_corners=False)  # (1, C, D, h, w)
+
             if self.use_beer_lambert:
-                # Return absorption (1-T) for X-ray visualization convention (bone = white)
                 if self.scatter:
-                    I_out_no_scatter = 1.0 - self.apply_poisson(torch.exp(-torch.sum(dens_tile[:, :-self.scatter_channels] * step_batch, dim=2)))
-                    I_out, I_primary, scatter_map, alpha = self.scatter(dens_tile[:, -self.scatter_channels:], step_batch)
-                    return torch.cat([I_out_no_scatter, 1.0-I_out], dim=1)
+                    I_out_no_scatter = 1.0 - self.apply_poisson(
+                        torch.exp(-torch.sum(dens_tile[:, :-self.scatter_channels] * step_size, dim=2))
+                    )
+                    I_out, _, _, _ = self.scatter(dens_tile[:, -self.scatter_channels:], step_size)
+                    return torch.cat([I_out_no_scatter, 1.0 - I_out], dim=1).squeeze(0)  # (C, h, w)
                 else:
-                    return 1.0 - self.apply_poisson(torch.exp(-torch.sum(dens_tile * step_batch, dim=2)))
+                    return (1.0 - self.apply_poisson(
+                        torch.exp(-torch.sum(dens_tile * step_size, dim=2))
+                    )).squeeze(0)
             else:
-                dens_tile = self.density_factor * dens_tile / self.ray_samples
+                d = self.density_factor * dens_tile / self.ray_samples
+                transmission = torch.cumprod(1.0 - d, dim=2)
+                weight = d * transmission
+                w_sum = weight.sum(dim=2)
+                alpha = 1.0 - torch.prod(1.0 - d, dim=2)
+                return (weight.sum(dim=2) / (w_sum + 1e-6) * alpha).squeeze(0)  # (C, h, w)
 
-                inv_dens = 1.0 - dens_tile
-                transmission = torch.cumprod(inv_dens, dim=2)
-                weight = dens_tile * transmission
-                w_sum = torch.sum(weight, dim=2)
-                render_tile = torch.sum(weight, dim=2) / (w_sum + 1e-6)
-
-                # color_tile = F.grid_sample(color, coords_tile, align_corners=False)
-                # render_tile = torch.sum(weight * color_tile, dim=2) / (w_sum + 1e-6)
-                alpha_tile = 1.0 - torch.prod(1 - dens_tile, dim=2)
-                render_tile = render_tile * alpha_tile
-                return render_tile
-        
-        # Process with spatial tiling
-        all_outputs = []
-        
-        for batch_idx, (density_batch, step_batch) in enumerate(
-            zip(torch.chunk(density, bs, dim=0), 
-                torch.chunk(step_size, bs) if isinstance(step_size, torch.Tensor) else [step_size] * bs)
-        ):
-            # Generate full coordinates once per batch element
-            sample_coords_full = self.generate_vtk_ray_samples_ijk(
-                vol.shape[2:],
-                ras2ijk,
-                view_mat[batch_idx:batch_idx+1],
-                fov_y_deg=20.0,
-                img_size=(self.h, self.w),
-                n_depth=self.ray_samples,
-                near=near[batch_idx:batch_idx+1] if isinstance(near, torch.Tensor) else near,
-                far=far[batch_idx:batch_idx+1] if isinstance(far, torch.Tensor) else far,
-            ).to(device=vol.device, dtype=vol.dtype)
-            batch_tiles = []
-            
-            # Tile over spatial dimensions (H, W)
+        if tile_h is None or (self.h < 2 * tile_h and self.w < 2 * tile_w):
+            # No tiling — single call
+            grid = ijk.permute(0, 1, 2, 3).unsqueeze(0)  # (1, D, H, W, 3)
+            if self.use_checkpointing and self.training:
+                out = cp.checkpoint(render_tile, grid, use_reentrant=False)
+            else:
+                out = render_tile(grid)
+        else:
+            # Tile over H and W
+            row_outputs = []
             for h_start in range(0, self.h, tile_h):
                 h_end = min(h_start + tile_h, self.h)
-                
-                row_tiles = []
-                
+                col_outputs = []
                 for w_start in range(0, self.w, tile_w):
                     w_end = min(w_start + tile_w, self.w)
-                    
-                    coords_tile = sample_coords_full[:, :, h_start:h_end, w_start:w_end, :]
-                    # Render tile (conditionally use checkpointing only in training)
-                    if self.training and self.use_checkpointing:
-                        render_tile = cp.checkpoint(
-                            tile_render_fn, density_batch, coords_tile, step_batch,
-                            use_reentrant=False
-                        )
+                    grid = ijk[:, h_start:h_end, w_start:w_end, :].unsqueeze(0)  # (1, D, h, w, 3)
+                    if self.use_checkpointing and self.training:
+                        tile_out = cp.checkpoint(render_tile, grid, use_reentrant=False)
                     else:
-                        render_tile = tile_render_fn(density_batch, coords_tile, step_batch)
-                    
-                    row_tiles.append(render_tile)
-                    
-                    # Explicit memory cleanup
-                    del coords_tile
-                
-                # Concatenate tiles in width dimension
-                batch_tiles.append(torch.cat(row_tiles, dim=-1))
-            
-            # Concatenate tiles in height dimension
-            batch_output = torch.cat(batch_tiles, dim=-2)
-            all_outputs.append(batch_output)
-        
-        render = torch.cat(all_outputs, dim=0)
-        return render
+                        tile_out = render_tile(grid)
+                    col_outputs.append(tile_out)
+                row_outputs.append(torch.cat(col_outputs, dim=-1))
+            out = torch.cat(row_outputs, dim=-2)  # (C, H, W)
 
-
-    def _forward_multi_view(self, vol, view_mat, ras2ijk, tiles=None):
-        """Handle N > bs case by processing views sequentially to save memory.
-        
-        Args:
-            vol (Tensor): Batch of volumes to render. Shape (BS, C, D, H, W).
-            view_mat (Tensor): A (N, 4, 4) transformation matrix where N > bs.
-            ras2ijk (Tensor): RAS to IJK transformation matrix.
-            tile_h (int): Tile height for spatial chunking
-            tile_w (int): Tile width for spatial chunking
-
-        Returns:
-            Batch of raycast images of shape (N, C, H, W)
-        """
-        bs = vol.size(0)
-        N = view_mat.shape[0]
-        views_per_vol = N // bs
-        
-        all_renders = []
-        
-        # Process each volume with its corresponding views sequentially
-        for vol_idx in range(bs):
-            view_start = vol_idx * views_per_vol
-            view_end = view_start + views_per_vol
-            
-            # Get single volume
-            vol_single = vol[vol_idx:vol_idx+1]
-            
-            for view_idx in range(view_start, view_end):
-                # Render single volume-view pair
-                if tiles is not None:
-                    render = self._forward_tiled(
-                        vol_single,
-                        view_mat[view_idx:view_idx+1],
-                        ras2ijk,
-                        tile_h=tiles[0],
-                        tile_w=tiles[1]
-                    )
-                else:
-                    render = self._forward_standard(
-                        vol_single,
-                        view_mat[view_idx:view_idx+1],
-                        ras2ijk
-                    )
-                all_renders.append(render)
-                
-        
-        return torch.cat(all_renders, dim=0)
-
-    def _forward_standard(self, vol, view_mat, ras2ijk):
-        ''' Renders a volume (with given view matrix) using raycasting.
-        Args:
-            vol (Tensor): Batch of volumes to render. Shape (BS, C, D, H, W). C=1 if `tf` is given.
-            tf (Tensor): Transfer Function (to apply to `vol`) either as texture (BS, C, W) or as lists of points [(N, C+1)] (len of list must match BS). If this is None, an RGBo `vol` is expected (default).
-            view_mat (Tensor or function): A (BS, 4, 4) transformation matrix representing the view matrix..
-
-        Returns:
-            Batch of raycast images of shape (BS, C, H, W)
-        '''
-     # Split volume into density and color
-     #    density = vol[:, [-1]].permute(0, 1, 4, 3, 2).contiguous()  # (B, 1, W, H, D)
-     #    color   = vol[:, :-1 ].permute(0, 1, 4, 3, 2).contiguous()  # (B, C-1, W, H, D)
-        density = vol.permute(0, 1, 4, 3, 2).contiguous()  # (B, C, W, H, D)
-        bs = density.size(0)
-        N = view_mat.shape[0]
-
-        if N < bs:
-            raise ValueError(
-                f"Number of view matrices ({N}) cannot be less than "
-                f"batch size ({bs}) unless N=1"
-            )
-        elif N == 1:
-            # Single view for all volumes - expand view
-            view_mat = view_mat.expand(bs, -1, -1)
-        elif N > bs:
-            if N % bs != 0:
-                raise ValueError(
-                    f"Number of view matrices ({N}) must be a multiple of "
-                    f"batch size ({bs}) when N > BS"
-                )
-            views_per_vol = N // bs
-
-            # Repeat each volume for its corresponding views
-            # vol[0] -> view[0:views_per_vol]
-            # vol[1] -> view[views_per_vol:2*views_per_vol]
-            # etc.
-            density = torch.repeat_interleave(density, views_per_vol, dim=0)
-            
-
-        # Expand and move samples to device
-        # sample_coords = self.samples.expand(bs, -1, -1, -1, -1).to(device=vol.device, dtype=vol.dtype)
-        # if view_mat is not None:
-        #     old_shape = sample_coords.shape
-        #     sample_coords = homogenize_vec(sample_coords.reshape(bs, -1, 3).permute(0, 2, 1))
-        #     sample_coords = torch.matmul(view_mat, sample_coords).permute(0, 2, 1)[..., :3].reshape(old_shape)
-        #     sample_coords *= 1.3
-        # near = 700.0
-        # far = 1300.0
-        near, far = self.compute_clipping_distances(view_mat, vol.shape[2:], torch.inverse(ras2ijk))
-
-        sample_coords = self.generate_vtk_ray_samples_ijk(
-            vol.shape[2:],
-            ras2ijk,
-            view_mat,
-            fov_y_deg=20.0,
-            img_size=(self.h, self.w),
-            n_depth=self.ray_samples,
-            near=near,
-            far=far,
-        ).to(device=vol.device, dtype=vol.dtype)
-
-        # Prepare output accumulation
-        B, S, H, W, _ = sample_coords.shape
-        out_rgb = []
-        step_size = 0.1 * (far - near) / self.ray_samples # step size in cm
-
-        # Define a checkpointable per-tile function
-        def tile_render_fn(density, coords_tile, step_batch):
-            dens_tile = F.grid_sample(density, coords_tile, align_corners=False)
-
-            if self.use_beer_lambert:
-                # Return absorption (1-T) for X-ray visualization convention (bone = white)
-                if self.scatter:
-                    I_out_no_scatter = 1.0 - self.apply_poisson(torch.exp(-torch.sum(dens_tile[:, :-self.scatter_channels] * step_batch, dim=2)))
-                    I_out, I_primary, scatter_map, alpha = self.scatter(dens_tile[:, -self.scatter_channels:], step_batch)
-                    return torch.cat([I_out_no_scatter, 1.0-I_out], dim=1)
-                else:
-                    return 1.0 - self.apply_poisson(torch.exp(-torch.sum(dens_tile * step_batch, dim=2)))
-            else:
-                dens_tile = self.density_factor * dens_tile / self.ray_samples
-
-                inv_dens = 1.0 - dens_tile
-                transmission = torch.cumprod(inv_dens, dim=2)
-                weight = dens_tile * transmission
-                w_sum = torch.sum(weight, dim=2)
-                render_tile = torch.sum(weight, dim=2) / (w_sum + 1e-6)
-
-                # color_tile = F.grid_sample(color, coords_tile, align_corners=False)
-                # render_tile = torch.sum(weight * color_tile, dim=2) / (w_sum + 1e-6)
-                alpha_tile = 1.0 - torch.prod(1 - dens_tile, dim=2)
-                render_tile = render_tile * alpha_tile
-                return render_tile
-
-        # Chunk along batch and checkpoint each tile
-        for density_batch, coords_batch, step_batch in zip(torch.chunk(density, B, dim=0), torch.chunk(sample_coords, B, dim=0), step_size):
-            # for density_tile, coords_tile in zip(torch.chunk(density_batch, S, dim=1), torch.chunk(coords_batch, S, dim=1)):
-            # Use checkpointing
-            if self.use_checkpointing:
-                render_tile = cp.checkpoint(tile_render_fn, density_batch, coords_batch, step_batch,
-                                                        use_reentrant=False)
-            else:
-                render_tile = tile_render_fn(density_batch, coords_batch, step_batch)
-
-            out_rgb.append(render_tile)
-
-        render = torch.cat(out_rgb, dim=0)
-        return render
+        return out
 
 
 if __name__ == '__main__':
     from monai.transforms import LoadImage, EnsureType, EnsureChannelFirst, ScaleIntensity, Compose, Spacing, \
     NormalizeIntensity, CenterSpatialCrop, RandAffine, ScaleIntensityRange
     from matplotlib import pyplot as plt
+    from torch.profiler import profile, record_function, ProfilerActivity
+
+    import torch._inductor.config as cfg
+    cfg.cpp.vec_isa_ok = False
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
     load_tf = Compose([
@@ -1103,7 +935,8 @@ if __name__ == '__main__':
     center = ijk2ras @ center
     print(center[:3])
 
-    ren = VolumeRaycaster(scatter=None, i0=1e4).cuda()
+    ren = VolumeRaycaster(scatter=None, i0=None).cuda().eval()
+    # ren = torch.compile(ren)
     # vol = torch.rand(8, 1, 128, 128, 128).cuda()
     # vol.requires_grad_(True)
 
@@ -1120,17 +953,44 @@ if __name__ == '__main__':
     view_mat = view_mat.repeat(4, 1, 1)
 
     start = timer()
-    out = ren(mu.expand(4, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
+    out = ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
     torch.cuda.synchronize()
     end = timer()
     print(out.shape, end-start)
 
     start = timer()
-    out = ren(mu.expand(4, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
+    out = ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
     torch.cuda.synchronize()
     end = timer()
     print(out.shape, end-start)
 
+    out2 = ren.forward_old(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
+    print(torch.allclose(out, out2, rtol=1e-4, atol=1e-3))
+
+    for _ in range(10):
+        with torch.no_grad():
+            ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
+    torch.cuda.synchronize()
+
+
+    mu_prof = mu.expand(4, 8, -1, -1, -1)
+
+    ren.eval()
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,  # True adds overhead, only enable for deep dives
+    ) as prof:
+        for _ in range(10):  # enough iterations to smooth noise
+            with record_function("vmap"):
+                with torch.no_grad():
+                    out = ren.forward(mu_prof, view_mat=view_mat, ras2ijk=ras2ijk)
+            torch.cuda.synchronize()  # must sync or CUDA ops appear instant
+    print(prof.key_averages().table(
+        sort_by="cuda_time_total",
+        row_limit=20,
+    ))
 
     # start = timer()
     # out.sum().backward()
@@ -1140,15 +1000,15 @@ if __name__ == '__main__':
 
     print(torch.cuda.memory_summary())
 
-    plt.figure()
-    plt.imshow(out[0,0].detach().cpu().numpy(), cmap='gray')
-    plt.show()
+    # plt.figure()
+    # plt.imshow(out[0,0].detach().cpu().numpy(), cmap='gray')
+    # plt.show()
+    #
+    # plt.figure()
+    # plt.imshow(out2[0,0].detach().cpu().numpy(), cmap='gray')
+    # plt.show()
 
-    plt.figure()
-    plt.imshow(out[0,-1].detach().cpu().numpy(), cmap='gray')
-    plt.show()
-
-    plt.figure()
-    plt.imshow(out[0,-1].detach().cpu().numpy() - out[0,0].detach().cpu().numpy(), cmap='gray')
-    plt.show()
-    print(torch.abs(out[0,-1] - out[0,0]).max())
+    # plt.figure()
+    # plt.imshow(out[0,-1].detach().cpu().numpy() - out[0,0].detach().cpu().numpy(), cmap='gray')
+    # plt.show()
+    # print(torch.abs(out[0,-1] - out[0,0]).max())
