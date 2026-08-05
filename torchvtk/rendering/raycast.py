@@ -17,6 +17,8 @@ from torchvtk.utils import make_2d, apply_tf_torch, apply_tf_tex_torch
 
 from timeit import default_timer as timer
 
+from triton_raycast import FusedVolumeRenderer
+
 __all__ = ['homogenize_mat', 'homogenize_vec', 'get_proj_mat', 'get_view_mat', 'get_vtk_view_mat', 'get_random_pos', 'VolumeRaycaster']
 
 def homogenize_mat(mat):
@@ -477,6 +479,7 @@ class VolumeRaycaster(nn.Module):
         # H = torch.linspace(-1, 1, self.h)
         # self.samples = self.get_coord_grid(Z, H, W, perspective=True)
         self.register_buffer('dirs_cam', torch.empty(self.h, self.w, 3), persistent=False)
+        self.triton_raycaster = FusedVolumeRenderer(self.ray_samples, self.density_factor, self.apply_poisson)
 
 
         if scatter is not None:
@@ -745,7 +748,7 @@ class VolumeRaycaster(nn.Module):
         return torch.clamp(noisy_transmission, 0, 1)
 
     def forward(self, vol: torch.Tensor, view_mat: torch.Tensor, ras2ijk: torch.Tensor,
-                tile_h: int = 256, tile_w: int = 256) -> torch.Tensor:
+                tile_h: int = 256, tile_w: int = 256, triton: bool = False) -> torch.Tensor:
         """
         Args:
             vol:      (B, C, D, H, W)
@@ -778,14 +781,16 @@ class VolumeRaycaster(nn.Module):
         _tile_w = tile_w if use_tiling else None
 
         vol_shape = torch.as_tensor(vol.shape[2:], device=vol.device, dtype=torch.float32)
+        if triton:
+            render_fn = lambda d, v, n, f: self.triton_raycaster(d, v, n, f, ras2ijk, vol_shape, self.dirs_cam)
+        else:
+            render_fn = torch.vmap(
+                lambda d, v, n, f: self._render_single(d, v, n, f, ras2ijk, vol_shape, _tile_h, _tile_w),
+                in_dims=(0, 0, 0, 0),
+                randomness='different',  # required if apply_poisson uses torch.randn_like
+            )
 
-        render_fn = torch.vmap(
-            lambda d, v, n, f: self._render_single(d, v, n, f, ras2ijk, vol_shape, _tile_h, _tile_w),
-            in_dims=(0, 0, 0, 0),
-            randomness='different',  # required if apply_poisson uses torch.randn_like
-        )
-
-        return render_fn(density.contiguous(), view_mat, near, far)  # (N, C, H, W)
+        return render_fn(density, view_mat, near, far)  # (N, C, H, W)
 
     def _render_single(
             self,
@@ -888,6 +893,7 @@ if __name__ == '__main__':
     NormalizeIntensity, CenterSpatialCrop, RandAffine, ScaleIntensityRange
     from matplotlib import pyplot as plt
     from torch.profiler import profile, record_function, ProfilerActivity
+    from torch.autograd import gradcheck
 
     import torch._inductor.config as cfg
     cfg.cpp.vec_isa_ok = False
@@ -935,7 +941,7 @@ if __name__ == '__main__':
     center = ijk2ras @ center
     print(center[:3])
 
-    ren = VolumeRaycaster(scatter=None, i0=None).cuda().eval()
+    ren = VolumeRaycaster(scatter=None, resolution=(1024,1024), i0=None).cuda().eval()
     # ren = torch.compile(ren)
     # vol = torch.rand(8, 1, 128, 128, 128).cuda()
     # vol.requires_grad_(True)
@@ -950,7 +956,7 @@ if __name__ == '__main__':
     #                             (-0.0018398770598324777, -0.0012575743709173355, 0.9999975166764699))
     # print(view_mat.inverse())
 
-    view_mat = view_mat.repeat(4, 1, 1)
+    view_mat = view_mat.repeat(1, 1, 1)
 
     start = timer()
     out = ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
@@ -958,22 +964,34 @@ if __name__ == '__main__':
     end = timer()
     print(out.shape, end-start)
 
+    plt.figure()
+    plt.imshow(out[0,0].detach().cpu().numpy(), cmap='gray')
+    plt.show()
+
     start = timer()
     out = ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
     torch.cuda.synchronize()
     end = timer()
     print(out.shape, end-start)
-
-    out2 = ren.forward_old(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
-    print(torch.allclose(out, out2, rtol=1e-4, atol=1e-3))
 
     for _ in range(10):
         with torch.no_grad():
             ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk)
     torch.cuda.synchronize()
 
+    with torch.no_grad():
+        out_triton = ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+        out_old = ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=False)
+        print(f'Old and Triton match: {torch.allclose(out_old, out_triton, atol=1e-4)}')
+        print(f'Old and Triton Max: {(out_old - out_triton).abs().max()}, Mean: {(out_old - out_triton).abs().mean()}')
+        fig, ax = plt.subplots(1,3)
+        ax[0].imshow(out_old[0, 0].detach().cpu().numpy(), cmap='gray')
+        ax[1].imshow(out_triton[0, 0].detach().cpu().numpy(), cmap='gray')
+        im = ax[2].imshow((out_old - out_triton)[0, 0].detach().cpu().numpy(), cmap='coolwarm')
+        cbar = fig.colorbar(im, ax=ax[2])
+        plt.show()
 
-    mu_prof = mu.expand(4, 8, -1, -1, -1)
+    mu_prof = mu.expand(1, 8, -1, -1, -1)
 
     ren.eval()
     with profile(
@@ -983,7 +1001,7 @@ if __name__ == '__main__':
         with_stack=False,  # True adds overhead, only enable for deep dives
     ) as prof:
         for _ in range(10):  # enough iterations to smooth noise
-            with record_function("vmap"):
+            with record_function("vmap_forward"):
                 with torch.no_grad():
                     out = ren.forward(mu_prof, view_mat=view_mat, ras2ijk=ras2ijk)
             torch.cuda.synchronize()  # must sync or CUDA ops appear instant
@@ -1012,3 +1030,83 @@ if __name__ == '__main__':
     # plt.imshow(out[0,-1].detach().cpu().numpy() - out[0,0].detach().cpu().numpy(), cmap='gray')
     # plt.show()
     # print(torch.abs(out[0,-1] - out[0,0]).max())
+
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.reset_accumulated_memory_stats()
+
+    ren = VolumeRaycaster(scatter=None, ray_samples=512, resolution=(1024,1024), i0=1e2).cuda().eval()
+
+
+    print("############ Triton Version ############")
+
+    start = timer()
+    out = ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+    torch.cuda.synchronize()
+    end = timer()
+    torch.cuda.synchronize()
+    end = timer()
+    print(out.shape, end-start)
+
+    with torch.no_grad():
+        _ = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+        _ = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+        start = timer()
+        out = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+        torch.cuda.synchronize()
+        end = timer()
+        print(out.shape, end-start)
+
+    plt.figure()
+    plt.imshow(out[0,0].detach().cpu().numpy(), cmap='gray')
+    plt.show()
+
+    for _ in range(10):
+        with torch.no_grad():
+            ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+    torch.cuda.synchronize()
+
+    ren.eval()
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,  # True adds overhead, only enable for deep dives
+    ) as prof:
+        for _ in range(10):  # enough iterations to smooth noise
+            with record_function("triton_forward"):
+                with torch.no_grad():
+                    out = ren.forward(mu_prof, view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+            torch.cuda.synchronize()  # must sync or CUDA ops appear instant
+    print(prof.key_averages().table(
+        sort_by="cuda_time_total",
+        row_limit=20,
+    ))
+
+    # start = timer()
+    # out.sum().backward()
+    # torch.cuda.synchronize()
+    # end = timer()
+    # print(end-start)
+
+
+    print(torch.cuda.memory_summary())
+
+    ren = VolumeRaycaster(scatter=None, resolution=(512,512), i0=None).cuda()
+
+    torch.manual_seed(0)
+    mu = torch.randn(2, 8, 24, 16, device='cuda', dtype=torch.float64, requires_grad=True)
+
+    # isolate the triton Function; gradcheck the full expanded graph in a second pass if you want
+    ok = gradcheck(
+        lambda m: ren(
+            m.expand(1, 2, -1, -1, -1),
+            view_mat=view_mat, ras2ijk=ras2ijk, triton=True,
+        ),
+        (mu,),
+        eps=1e-6,
+        atol=1e-4,  # looser than the fp64 default 1e-5 to absorb kernel fp noise
+        rtol=1e-3,
+        nondet_tol=1e-6,  # tl.atomic_add is order-nondeterministic
+        fast_mode=True,
+    )
+    print("gradcheck passed:", ok)
