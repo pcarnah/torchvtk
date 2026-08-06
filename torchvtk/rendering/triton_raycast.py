@@ -52,6 +52,7 @@ if HAS_TRITON:
             stride_vb,
             stride_v_row,
 
+            ACC_DTYPE: tl.constexpr,   # tl.float32 or tl.float64 — accumulation/compute precision
             BLOCK_H: tl.constexpr,
             BLOCK_W: tl.constexpr,
     ):
@@ -69,6 +70,13 @@ if HAS_TRITON:
 
         # ----------------------------------------------------------------------
         # Load ray directions
+        #
+        # dirs_ptr/origin_ptr/depths_ptr/scale_ptr are produced on the Python
+        # side already cast to ACC_DTYPE (they're tiny — cam params / a
+        # handful of scalars — so upcasting them costs ~nothing but keeps the
+        # position math at full compute precision). density_ptr is left in
+        # its native storage dtype and only cast to ACC_DTYPE per-element
+        # after loading, since that's the tensor that's actually large.
         # ----------------------------------------------------------------------
         b_dirs_offset = pid_b * stride_sb
 
@@ -99,9 +107,9 @@ if HAS_TRITON:
         H_max = tl.load(t_ptr + 1).to(tl.int32)
         D_max = tl.load(t_ptr + 2).to(tl.int32)
 
-        Wf = W_max.to(tl.float32)
-        Hf = H_max.to(tl.float32)
-        Df = D_max.to(tl.float32)
+        Wf = W_max.to(ACC_DTYPE)
+        Hf = H_max.to(ACC_DTYPE)
+        Df = D_max.to(ACC_DTYPE)
 
         base_b_density = pid_b * stride_db
         b_depths_ptr = depths_ptr + pid_b * D
@@ -111,7 +119,7 @@ if HAS_TRITON:
         # ----------------------------------------------------------------------
         for c in range(C):
 
-            accum_density = tl.zeros((BLOCK_H, BLOCK_W), dtype=tl.float32)
+            accum_density = tl.zeros((BLOCK_H, BLOCK_W), dtype=ACC_DTYPE)
 
             base_c = base_b_density + c * stride_dc
 
@@ -160,9 +168,9 @@ if HAS_TRITON:
                 # --------------------------------------------------------------
                 # Weights
                 # --------------------------------------------------------------
-                wx1 = ix - ix0.to(tl.float32)
-                wy1 = iy - iy0.to(tl.float32)
-                wz1 = iz - iz0.to(tl.float32)
+                wx1 = ix - ix0.to(ACC_DTYPE)
+                wy1 = iy - iy0.to(ACC_DTYPE)
+                wz1 = iz - iz0.to(ACC_DTYPE)
 
                 wx0 = 1.0 - wx1
                 wy0 = 1.0 - wy1
@@ -200,15 +208,18 @@ if HAS_TRITON:
                 # Loads — mask determines the zero-padding, clamped index
                 # just keeps the address itself safe
                 # --------------------------------------------------------------
-                v000 = tl.load(ptr_y0x0z0, mask=m000, other=0.0).to(tl.float32)
-                v001 = tl.load(ptr_y0x0z1, mask=m001, other=0.0).to(tl.float32)
-                v010 = tl.load(ptr_y1x0z0, mask=m010, other=0.0).to(tl.float32)
-                v011 = tl.load(ptr_y1x0z1, mask=m011, other=0.0).to(tl.float32)
+                # Loaded in density's native (compact) storage dtype, then
+                # upcast to ACC_DTYPE for the interpolation math below —
+                # this is the only place native-dtype memory traffic happens.
+                v000 = tl.load(ptr_y0x0z0, mask=m000, other=0.0).to(ACC_DTYPE)
+                v001 = tl.load(ptr_y0x0z1, mask=m001, other=0.0).to(ACC_DTYPE)
+                v010 = tl.load(ptr_y1x0z0, mask=m010, other=0.0).to(ACC_DTYPE)
+                v011 = tl.load(ptr_y1x0z1, mask=m011, other=0.0).to(ACC_DTYPE)
 
-                v100 = tl.load(ptr_y0x1z0, mask=m100, other=0.0).to(tl.float32)
-                v101 = tl.load(ptr_y0x1z1, mask=m101, other=0.0).to(tl.float32)
-                v110 = tl.load(ptr_y1x1z0, mask=m110, other=0.0).to(tl.float32)
-                v111 = tl.load(ptr_y1x1z1, mask=m111, other=0.0).to(tl.float32)
+                v100 = tl.load(ptr_y0x1z0, mask=m100, other=0.0).to(ACC_DTYPE)
+                v101 = tl.load(ptr_y0x1z1, mask=m101, other=0.0).to(ACC_DTYPE)
+                v110 = tl.load(ptr_y1x1z0, mask=m110, other=0.0).to(ACC_DTYPE)
+                v111 = tl.load(ptr_y1x1z1, mask=m111, other=0.0).to(ACC_DTYPE)
 
                 interp = (
                         v000 * wx0 * wy0 * wz0 +
@@ -273,6 +284,7 @@ if HAS_TRITON:
             stride_vb,
             stride_v_row,
 
+            ACC_DTYPE: tl.constexpr,   # tl.float32 or tl.float64 — accumulation/compute precision
             BLOCK_H: tl.constexpr,
             BLOCK_W: tl.constexpr,
     ):
@@ -309,9 +321,9 @@ if HAS_TRITON:
         H_max = tl.load(t_ptr + 1).to(tl.int32)
         D_max = tl.load(t_ptr + 2).to(tl.int32)
 
-        Wf = W_max.to(tl.float32)
-        Hf = H_max.to(tl.float32)
-        Df = D_max.to(tl.float32)
+        Wf = W_max.to(ACC_DTYPE)
+        Hf = H_max.to(ACC_DTYPE)
+        Df = D_max.to(ACC_DTYPE)
 
         base_b_density = pid_b * stride_db
         b_depths_ptr = depths_ptr + pid_b * D   # D == R_dim now
@@ -360,9 +372,9 @@ if HAS_TRITON:
                 m110 = hw_mask & x1_valid & y1_valid & z0_valid
                 m111 = hw_mask & x1_valid & y1_valid & z1_valid
 
-                wx1 = ix - ix0.to(tl.float32)
-                wy1 = iy - iy0.to(tl.float32)
-                wz1 = iz - iz0.to(tl.float32)
+                wx1 = ix - ix0.to(ACC_DTYPE)
+                wy1 = iy - iy0.to(ACC_DTYPE)
+                wz1 = iz - iz0.to(ACC_DTYPE)
 
                 wx0 = 1.0 - wx1
                 wy0 = 1.0 - wy1
@@ -394,6 +406,23 @@ if HAS_TRITON:
                 tl.atomic_add(ptr_y1x1z0, g * wx1 * wy1 * wz0, mask=m110)
                 tl.atomic_add(ptr_y1x1z1, g * wx1 * wy1 * wz1, mask=m111)
 
+def _acc_dtype_for(t: torch.Tensor) -> torch.dtype:
+    """Precision to accumulate/compute in.
+
+    fp64 input -> fp64 accumulation (needed for gradcheck-grade precision).
+    fp16/bf16/fp32 input -> fp32 accumulation. Summing across `ray_samples`
+    (often hundreds) of trilinear-interpolated terms in fp16/bf16 loses
+    real accuracy (10/7 mantissa bits), so we always upcast at least to
+    fp32 for the math while leaving the density tensor itself in its
+    native (smaller) storage dtype to keep memory traffic/footprint low.
+    """
+    return torch.float64 if t.dtype == torch.float64 else torch.float32
+
+
+def _tl_dtype(torch_dtype: torch.dtype):
+    return tl.float64 if torch_dtype == torch.float64 else tl.float32
+
+
 # ==============================================================================
 # PYTORCH AUTOGRAD WRAPPER
 # ==============================================================================
@@ -409,6 +438,20 @@ class _FusedVolumeRenderFunction(torch.autograd.Function):
             scale,
             vol_shape
     ):
+        # Accumulation precision is driven by the density tensor's dtype;
+        # the small auxiliary tensors (ray dirs/origin/depths/scale/shape)
+        # are upcast to match so all position/weight math happens at full
+        # compute precision without materializing a second copy of the
+        # (large) density volume.
+        acc_dtype = _acc_dtype_for(density)
+        tl_acc_dtype = _tl_dtype(acc_dtype)
+
+        dirs_ijk = dirs_ijk.to(acc_dtype)
+        origin_ijk = origin_ijk.to(acc_dtype)
+        depths = depths.to(acc_dtype)
+        scale = scale.to(acc_dtype)
+        vol_shape = vol_shape.to(acc_dtype)
+
         ctx.save_for_backward(
             density,
             dirs_ijk,
@@ -417,15 +460,21 @@ class _FusedVolumeRenderFunction(torch.autograd.Function):
             scale,
             vol_shape
         )
+        ctx.acc_dtype = acc_dtype
 
         B, C, W, H, D_dim = density.shape
         _, H_out, W_out, _ = dirs_ijk.shape
         R_dim = depths.shape[1]
 
+        # Output carries the accumulation precision (fp32, or fp64 to match
+        # a fp64 density input) rather than the density's own storage dtype,
+        # so the trilinear-sum result isn't truncated before the caller has
+        # a chance to use it. The output tensor is comparatively tiny
+        # (B,C,H,W) vs. the density volume, so this costs little memory.
         out = torch.empty(
             (B, C, H_out, W_out),
             device=density.device,
-            dtype=torch.float32
+            dtype=acc_dtype
         )
 
         grid = lambda meta: (
@@ -454,6 +503,8 @@ class _FusedVolumeRenderFunction(torch.autograd.Function):
             origin_ijk.stride(0),
             origin_ijk.stride(1),
 
+            ACC_DTYPE=tl_acc_dtype,
+
             # BLOCK_H=8,
             # BLOCK_W=8,
         )
@@ -463,11 +514,21 @@ class _FusedVolumeRenderFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         density, dirs_ijk, origin_ijk, depths, scale, vol_shape = ctx.saved_tensors
+        acc_dtype = ctx.acc_dtype
+        tl_acc_dtype = _tl_dtype(acc_dtype)
 
         B, C, W, H, D_dim = density.shape
         _, H_out, W_out, _ = dirs_ijk.shape
 
-        grad_density = torch.zeros_like(density)
+        # Accumulate gradients in acc_dtype via atomic_add (fp16/bf16 atomics
+        # are poorly supported and would silently truncate every add), then
+        # cast down to density's native dtype once at the very end — a
+        # single rounding step instead of one per ray sample.
+        grad_density_acc = torch.zeros(density.shape, device=density.device, dtype=acc_dtype)
+
+        grad_output = grad_output.contiguous()
+        if grad_output.dtype != acc_dtype:
+            grad_output = grad_output.to(acc_dtype)
 
         grid = lambda meta: (
             triton.cdiv(H_out, meta["BLOCK_H"]),
@@ -477,16 +538,19 @@ class _FusedVolumeRenderFunction(torch.autograd.Function):
 
         R_dim = depths.shape[1]
         _bwd_kernel[grid](
-            grad_output.contiguous(),
-            grad_density,
+            grad_output,
+            grad_density_acc,
             dirs_ijk, origin_ijk, depths, scale, vol_shape,
             B, C, H_out, W_out, R_dim,  # was D_dim
             *density.stride(),
             *dirs_ijk.stride()[:3],
             origin_ijk.stride(0),
             origin_ijk.stride(1),
+            ACC_DTYPE=tl_acc_dtype,
             BLOCK_H=4, BLOCK_W=4,
         )
+
+        grad_density = grad_density_acc.to(density.dtype)
 
         return grad_density, None, None, None, None, None
 
@@ -523,14 +587,30 @@ class FusedVolumeRenderer(torch.nn.Module):
             vol_shape: torch.Tensor,
             dirs_cam: torch.Tensor,
     ) -> torch.Tensor:
+        if not HAS_TRITON:
+            raise ModuleNotFoundError("Requires triton.")
+
         B = density.shape[0]
+        device = density.device
+
+        orig_dtype = density.dtype
+        # fp64 density (e.g. gradcheck) -> fp64 compute throughout the ray
+        # setup math; everything else (fp16/bf16/fp32) computes in fp32.
+        # These are all small tensors (camera params, per-ray directions),
+        # so upcasting them is essentially free — the memory- and
+        # bandwidth-heavy tensor is `density`, which stays in its native
+        # dtype and is only upcast per-sample inside the kernel.
+        compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
+
+        view_mat = view_mat.to(compute_dtype)
+        near = near.to(compute_dtype)
+        far = far.to(compute_dtype)
+        ras2ijk = ras2ijk.to(device, dtype=compute_dtype)
+        vol_shape = vol_shape.to(device, dtype=compute_dtype)
+        dirs_cam = dirs_cam.to(compute_dtype)
 
         cam2world = view_mat[:, :3, :3]
         cam_pos = view_mat[:, :3, 3]
-
-        device = density.device
-
-        ras2ijk = ras2ijk.to(device, dtype=torch.float32)
 
         R = ras2ijk[:3, :3]
         t = ras2ijk[:3, 3]
@@ -549,7 +629,7 @@ class FusedVolumeRenderer(torch.nn.Module):
                 2.0 / (vol_shape - 1)
         ).view(1, 1, 1, 1, 3)
 
-        t_vals = torch.linspace(0, 1, self.ray_samples, device=device)[None, :]
+        t_vals = torch.linspace(0, 1, self.ray_samples, device=device, dtype=compute_dtype)[None, :]
         depths = near[:, None] + (far - near)[:, None] * t_vals
 
         # What should be correct ijk coordinate math. Want to compute within kernel to avoid materializing large tensor
@@ -562,7 +642,7 @@ class FusedVolumeRenderer(torch.nn.Module):
             depths,
             scale,
             vol_shape
-        )
+        )  # returned in compute_dtype (see _acc_dtype_for)
 
         step_size = (
                 0.1
@@ -576,4 +656,7 @@ class FusedVolumeRenderer(torch.nn.Module):
 
         out = 1.0 - self.apply_poisson(scaled_extinction)
 
-        return out
+        # Restore the caller's dtype at the boundary — internal math stayed
+        # at compute_dtype for accuracy, but callers shouldn't be surprised
+        # by a fp16 volume producing an fp32 render.
+        return out.to(orig_dtype)
