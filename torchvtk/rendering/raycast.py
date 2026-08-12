@@ -17,7 +17,7 @@ from torchvtk.utils import make_2d, apply_tf_torch, apply_tf_tex_torch
 
 from timeit import default_timer as timer
 
-from triton_raycast import FusedVolumeRenderer
+from .triton_raycast import FusedVolumeRenderer
 
 __all__ = ['homogenize_mat', 'homogenize_vec', 'get_proj_mat', 'get_view_mat', 'get_vtk_view_mat', 'get_random_pos', 'VolumeRaycaster']
 
@@ -941,7 +941,7 @@ if __name__ == '__main__':
     center = ijk2ras @ center
     print(center[:3])
 
-    ren = VolumeRaycaster(scatter=None, resolution=(1024,1024), i0=None).cuda().eval()
+    ren = VolumeRaycaster(scatter=None, resolution=(1024,1024), i0=None, ray_samples=384).cuda().eval()
     # ren = torch.compile(ren)
     # vol = torch.rand(8, 1, 128, 128, 128).cuda()
     # vol.requires_grad_(True)
@@ -1034,7 +1034,7 @@ if __name__ == '__main__':
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.reset_accumulated_memory_stats()
 
-    ren = VolumeRaycaster(scatter=None, ray_samples=512, resolution=(1024,1024), i0=1e2).cuda().eval()
+    # ren = VolumeRaycaster(scatter=None, ray_samples=512, resolution=(1024,1024), i0=1e2).cuda().eval()
 
 
     print("############ Triton Version ############")
@@ -1091,6 +1091,35 @@ if __name__ == '__main__':
 
     print(torch.cuda.memory_summary())
 
+    with torch.no_grad():
+        with torch.autocast(device_type="cuda"):
+            _ = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+            _ = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+            start = timer()
+            out_triton = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True).float()
+            torch.cuda.synchronize()
+            end = timer()
+            print("Triton fp16", end - start)
+
+            start = timer()
+            out_old = ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=False).float()
+            torch.cuda.synchronize()
+            end = timer()
+            print("Orig fp16", end - start)
+
+        print(f'Old and Triton match fp16: {torch.allclose(out_old, out_triton, atol=1e-4)}')
+        print(
+            f'Old and Triton Max fp16: {(out_old - out_triton).abs().max()}, Mean: {(out_old - out_triton).abs().mean()}')
+
+        out_triton_fp32 = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True).float()
+        out_old_fp32 = ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=False).float()
+
+        print(f'Old match fp32/fp16: {torch.allclose(out_old, out_old_fp32, atol=1e-4)}')
+        print(f'Triton match fp32/fp16: {torch.allclose(out_triton_fp32, out_triton, atol=1e-4)}')
+
+        print(
+            f'Triton Max fp16/32: {(out_triton_fp32 - out_triton).abs().max()}, Mean: {(out_triton_fp32 - out_triton).abs().mean()}')
+
     ren = VolumeRaycaster(scatter=None, resolution=(512,512), i0=None).cuda()
 
     torch.manual_seed(0)
@@ -1110,3 +1139,5 @@ if __name__ == '__main__':
         fast_mode=True,
     )
     print("gradcheck passed:", ok)
+
+
