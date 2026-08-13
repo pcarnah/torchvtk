@@ -777,7 +777,7 @@ class VolumeRaycaster(nn.Module):
             if N == 1:
                 view_mat = view_mat.expand(bs, -1, -1)
 
-                near, far = self.compute_clipping_distances(view_mat, vol.shape[2:], torch.inverse(ras2ijk))
+            near, far = self.compute_clipping_distances(view_mat, vol.shape[2:], torch.inverse(ras2ijk))
 
             use_tiling = self.h >= 2 * tile_h or self.w >= 2 * tile_w
             _tile_h = tile_h if use_tiling else None
