@@ -1,0 +1,151 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchvtk"
+dynamic = ["version"]
+description = "Efficient data loading and visualization for volumes in PyTorch"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [
+    { name = "Dominik Engel" },
+    { name = "Marc Fabian Mezger" },
+]
+keywords = [
+    "pytorch",
+    "volume",
+    "raycasting",
+    "rendering",
+    "medical-imaging",
+    "deep-learning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+
+# ---------------------------------------------------------------------------
+# Core runtime dependencies.
+#
+# PyTorch ships separate wheels per CUDA version. The default `pip install
+# torchvtk` will pull `torch` from PyPI (CPU build on most platforms). To
+# install with a specific CUDA version, use one of the optional groups below:
+#
+#     pip install torchvtk[cu128]   # PyTorch built against CUDA 12.8
+#     pip install torchvtk[cu130]   # PyTorch built against CUDA 13.0
+#
+# For each CUDA build, point pip at the matching PyTorch index, e.g.:
+#     pip install torchvtk[cu128] \
+#         --extra-index-url https://download.pytorch.org/whl/cu128
+#
+# `triton` is the upstream package on Linux/macOS; the community-maintained
+# `triton-windows` fork is the only available build on Windows (the upstream
+# `triton` does not publish Windows wheels). The PEP 508 environment marker
+# selects the right one for the current platform.
+# ---------------------------------------------------------------------------
+dependencies = [
+    "torch >= 2.5",
+    "torchvision >= 0.20",
+    "numpy",
+    "matplotlib",
+    "psutil",
+    "tqdm",
+    "h5py",
+    "monai",
+    "requests",
+    "triton >= 2.1; sys_platform != 'win32'",
+    "triton-windows >= 3.0; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+# ---------------------------------------------------------------------------
+# CUDA-version-specific PyTorch builds. Each extra pins torch + torchvision
+# to versions that are known to ship the requested CUDA wheel. To actually
+# get the CUDA build, the user must also pass the matching PyTorch index:
+#
+#     pip install torchvtk[cu128] --extra-index-url https://download.pytorch.org/whl/cu128
+#     pip install torchvtk[cu130] --extra-index-url https://download.pytorch.org/whl/cu130
+# ---------------------------------------------------------------------------
+cu128 = [
+    "torch >= 2.5.0, < 2.7",
+    "torchvision >= 0.20.0, < 0.22",
+]
+cu130 = [
+    "torch >= 2.6.0, < 3.0",
+    "torchvision >= 0.21.0, < 0.23",
+]
+# CPU-only build (the default `pip install torchvtk` also picks this up).
+cpu = [
+    "torch >= 2.5",
+    "torchvision >= 0.20",
+]
+
+# ---------------------------------------------------------------------------
+# Functional extras
+# ---------------------------------------------------------------------------
+# DICOM support (used by torchvtk.converters.dicom). pydicom needs `gdcm`
+# available on the system (typically installed via conda) for the full
+# feature set.
+dicom = [
+    "pydicom",
+    "dicom_numpy",
+]
+# Transfer-function features (torchvtk.utils.tf_utils) need torchinterp1d,
+# which is not on PyPI — pulled directly from GitHub via PEP 508 URL ref
+# (this replaces the old, deprecated `dependency_links` approach).
+tf = [
+    "torchinterp1d @ git+https://github.com/aliutkus/torchinterp1d.git@master",
+]
+# Tooling/scripts: nibabel is only required by the medical-decathlon
+# crawler script; pull it in only when needed.
+data = [
+    "nibabel",
+]
+# Convenience: install everything optional (pick one CUDA variant first).
+all = [
+    "torchvtk[dicom,tf,data]",
+]
+
+[project.urls]
+Homepage = "https://github.com/torchvtk/torchvtk"
+Repository = "https://github.com/torchvtk/torchvtk.git"
+Documentation = "https://torchvtk.github.io"
+Issues = "https://github.com/torchvtk/torchvtk/issues"
+
+[tool.setuptools]
+include-package-data = true
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["torchvtk*"]
+# Converters are part of the package, only exclude top-level dev dirs.
+exclude = [
+    "docs*",
+    "tests*",
+    "test*",
+    "benchmarks*",
+]
+
+[tool.setuptools.package-data]
+# Ship the small bundled test data with the wheel.
+torchvtk = ["data/*.pt"]
+
+[tool.setuptools.dynamic]
+# Read the version from torchvtk/__init__.py so we only have to bump it
+# in one place.
+version = { attr = "torchvtk.__version__" }

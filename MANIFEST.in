@@ -1,0 +1,10 @@
+# Files to include in the source distribution (sdist) beyond what
+# setuptools auto-detects from pyproject.toml.
+
+# Standard project metadata files
+include LICENSE
+include README.md
+include pyproject.toml
+
+# Ship the small bundled test data
+recursive-include torchvtk/data *.pt
