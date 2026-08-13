@@ -17,7 +17,7 @@ from torchvtk.utils import make_2d, apply_tf_torch, apply_tf_tex_torch
 
 from timeit import default_timer as timer
 
-from .triton_raycast import FusedVolumeRenderer
+from torchvtk.rendering.triton_raycast import FusedVolumeRenderer
 
 __all__ = ['homogenize_mat', 'homogenize_vec', 'get_proj_mat', 'get_view_mat', 'get_vtk_view_mat', 'get_random_pos', 'VolumeRaycaster']
 
