@@ -258,7 +258,21 @@ if HAS_TRITON:
     #   voxel-space accumulation tiles
     #
     # ==========================================================================
-
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_H': 4, 'BLOCK_W': 4}),
+            triton.Config({'BLOCK_H': 4, 'BLOCK_W': 8}),
+            triton.Config({'BLOCK_H': 8, 'BLOCK_W': 4}),
+            triton.Config({'BLOCK_H': 8, 'BLOCK_W': 8}),
+            triton.Config({'BLOCK_H': 8, 'BLOCK_W': 16}),
+            # smaller blocks worth including explicitly here since backward's
+            # bottleneck is atomic contention, not memory bandwidth — the
+            # optimum may sit at a different point than forward's
+            triton.Config({'BLOCK_H': 2, 'BLOCK_W': 2}),
+            triton.Config({'BLOCK_H': 2, 'BLOCK_W': 4}),
+        ],
+        key=['H', 'W']
+    )
     @triton.jit
     def _bwd_kernel(
             grad_out_ptr,
@@ -337,7 +351,7 @@ if HAS_TRITON:
                     + w_offs[None, :]
             )
 
-            g = tl.load(grad_out_ptr + grad_out_idx, mask=hw_mask, other=0.0)
+            g = tl.load(grad_out_ptr + grad_out_idx, mask=hw_mask, other=0.0).to(ACC_DTYPE)
 
             base_c = base_b_density + c * stride_dc
 
@@ -547,7 +561,7 @@ class _FusedVolumeRenderFunction(torch.autograd.Function):
             origin_ijk.stride(0),
             origin_ijk.stride(1),
             ACC_DTYPE=tl_acc_dtype,
-            BLOCK_H=4, BLOCK_W=4,
+            # BLOCK_H=4, BLOCK_W=4,
         )
 
         grad_density = grad_density_acc.to(density.dtype)
