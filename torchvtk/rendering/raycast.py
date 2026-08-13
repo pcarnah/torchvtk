@@ -757,40 +757,43 @@ class VolumeRaycaster(nn.Module):
         Returns:
             (N, C, H, W)
         """
-        bs = vol.shape[0]
-        N = view_mat.shape[0]
+        with torch.autocast(device_type='cuda', enabled=False):
 
-        if N < bs:
-            raise ValueError(f"view_mat has {N} entries but batch size is {bs}")
-        if N > bs and N % bs != 0:
-            raise ValueError(f"N ({N}) must be a multiple of batch size ({bs})")
+            bs = vol.shape[0]
+            N = view_mat.shape[0]
 
-        # Expand density to match number of views
-        views_per_vol = N // bs
-        density = vol.permute(0, 1, 4, 3, 2)  # (B, C, W, H, D)
-        if views_per_vol > 1:
-            density = density.repeat_interleave(views_per_vol, dim=0)  # (N, C, W, H, D)
-        # N==1 broadcast: expand view_mat to bs
-        if N == 1:
-            view_mat = view_mat.expand(bs, -1, -1)
+            if N < bs:
+                raise ValueError(f"view_mat has {N} entries but batch size is {bs}")
+            if N > bs and N % bs != 0:
+                raise ValueError(f"N ({N}) must be a multiple of batch size ({bs})")
 
-        near, far = self.compute_clipping_distances(view_mat, vol.shape[2:], torch.inverse(ras2ijk))
+            # Expand density to match number of views
+            views_per_vol = N // bs
+            density = vol.permute(0, 1, 4, 3, 2)  # (B, C, W, H, D)
+            if views_per_vol > 1:
+                density = density.repeat_interleave(views_per_vol, dim=0)  # (N, C, W, H, D)
 
-        use_tiling = self.h >= 2 * tile_h or self.w >= 2 * tile_w
-        _tile_h = tile_h if use_tiling else None
-        _tile_w = tile_w if use_tiling else None
+            # N==1 broadcast: expand view_mat to bs
+            if N == 1:
+                view_mat = view_mat.expand(bs, -1, -1)
 
-        vol_shape = torch.as_tensor(vol.shape[2:], device=vol.device, dtype=torch.float32)
-        if triton:
-            render_fn = lambda d, v, n, f: self.triton_raycaster(d, v, n, f, ras2ijk, vol_shape, self.dirs_cam)
-        else:
-            render_fn = torch.vmap(
-                lambda d, v, n, f: self._render_single(d, v, n, f, ras2ijk, vol_shape, _tile_h, _tile_w),
-                in_dims=(0, 0, 0, 0),
-                randomness='different',  # required if apply_poisson uses torch.randn_like
-            )
+                near, far = self.compute_clipping_distances(view_mat, vol.shape[2:], torch.inverse(ras2ijk))
 
-        return render_fn(density, view_mat, near, far)  # (N, C, H, W)
+            use_tiling = self.h >= 2 * tile_h or self.w >= 2 * tile_w
+            _tile_h = tile_h if use_tiling else None
+            _tile_w = tile_w if use_tiling else None
+
+            vol_shape = torch.as_tensor(vol.shape[2:], device=vol.device, dtype=torch.float32)
+            if triton:
+                render_fn = lambda d, v, n, f: self.triton_raycaster(d, v, n, f, ras2ijk, vol_shape, self.dirs_cam)
+            else:
+                render_fn = torch.vmap(
+                    lambda d, v, n, f: self._render_single(d, v, n, f, ras2ijk, vol_shape, _tile_h, _tile_w),
+                    in_dims=(0, 0, 0, 0),
+                    randomness='different',  # required if apply_poisson uses torch.randn_like
+                )
+
+            return render_fn(density, view_mat, near, far)  # (N, C, H, W)
 
     def _render_single(
             self,
@@ -1107,6 +1110,21 @@ if __name__ == '__main__':
             end = timer()
             print("Orig fp16", end - start)
 
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _ = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+            _ = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True)
+            start = timer()
+            out_triton_bf16 = ren(mu.expand(1, 1, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=True).float()
+            torch.cuda.synchronize()
+            end = timer()
+            print("Triton bf16", end - start)
+
+            start = timer()
+            out_old_bf16 = ren(mu.expand(1, 8, -1, -1, -1), view_mat=view_mat, ras2ijk=ras2ijk, triton=False).float()
+            torch.cuda.synchronize()
+            end = timer()
+            print("Orig bf16", end - start)
+
         print(f'Old and Triton match fp16: {torch.allclose(out_old, out_triton, atol=1e-4)}')
         print(
             f'Old and Triton Max fp16: {(out_old - out_triton).abs().max()}, Mean: {(out_old - out_triton).abs().mean()}')
@@ -1119,6 +1137,10 @@ if __name__ == '__main__':
 
         print(
             f'Triton Max fp16/32: {(out_triton_fp32 - out_triton).abs().max()}, Mean: {(out_triton_fp32 - out_triton).abs().mean()}')
+
+        print(f'Triton match fp32/bf16: {torch.allclose(out_triton_fp32, out_triton_bf16, atol=1e-4)}')
+        print(
+            f'Triton Max bf16/32: {(out_triton_fp32 - out_triton_bf16).abs().max()}, Mean: {(out_triton_fp32 - out_triton_bf16).abs().mean()}')
 
     ren = VolumeRaycaster(scatter=None, resolution=(512,512), i0=None).cuda()
 

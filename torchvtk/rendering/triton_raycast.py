@@ -604,73 +604,75 @@ class FusedVolumeRenderer(torch.nn.Module):
         if not HAS_TRITON:
             raise ModuleNotFoundError("Requires triton.")
 
-        B = density.shape[0]
-        device = density.device
+        with torch.autocast(device_type='cuda', enabled=False):
+            B = density.shape[0]
+            device = density.device
 
-        orig_dtype = density.dtype
-        # fp64 density (e.g. gradcheck) -> fp64 compute throughout the ray
-        # setup math; everything else (fp16/bf16/fp32) computes in fp32.
-        # These are all small tensors (camera params, per-ray directions),
-        # so upcasting them is essentially free — the memory- and
-        # bandwidth-heavy tensor is `density`, which stays in its native
-        # dtype and is only upcast per-sample inside the kernel.
-        compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
+            orig_dtype = density.dtype
+            # fp64 density (e.g. gradcheck) -> fp64 compute throughout the ray
+            # setup math; everything else (fp16/bf16/fp32) computes in fp32.
+            # These are all small tensors (camera params, per-ray directions),
+            # so upcasting them is essentially free — the memory- and
+            # bandwidth-heavy tensor is `density`, which stays in its native
+            # dtype and is only upcast per-sample inside the kernel.
+            compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
 
-        view_mat = view_mat.to(compute_dtype)
-        near = near.to(compute_dtype)
-        far = far.to(compute_dtype)
-        ras2ijk = ras2ijk.to(device, dtype=compute_dtype)
-        vol_shape = vol_shape.to(device, dtype=compute_dtype)
-        dirs_cam = dirs_cam.to(compute_dtype)
+            view_mat = view_mat.to(compute_dtype)
+            near = near.to(compute_dtype)
+            far = far.to(compute_dtype)
+            ras2ijk = ras2ijk.to(device, dtype=compute_dtype)
+            vol_shape = vol_shape.to(device, dtype=compute_dtype)
+            dirs_cam = dirs_cam.to(compute_dtype)
 
-        cam2world = view_mat[:, :3, :3]
-        cam_pos = view_mat[:, :3, 3]
+            cam2world = view_mat[:, :3, :3]
+            cam_pos = view_mat[:, :3, 3]
 
-        R = ras2ijk[:3, :3]
-        t = ras2ijk[:3, 3]
+            R = ras2ijk[:3, :3]
+            t = ras2ijk[:3, 3]
 
-        dirs_world = torch.einsum(
-            'bij,hwj->bhwi',
-            cam2world,
-            dirs_cam
-        )
 
-        dirs_ijk = torch.einsum('bhwi,ji->bhwj', dirs_world, R)
+            dirs_world = torch.einsum(
+                'bij,hwj->bhwi',
+                cam2world,
+                dirs_cam
+            )
 
-        origin_ijk = torch.einsum('bi,ji->bj', cam_pos, R) + t
+            dirs_ijk = torch.einsum('bhwi,ji->bhwj', dirs_world, R)
 
-        scale = (
-                2.0 / (vol_shape - 1)
-        ).view(1, 1, 1, 1, 3)
+            origin_ijk = torch.einsum('bi,ji->bj', cam_pos, R) + t
 
-        t_vals = torch.linspace(0, 1, self.ray_samples, device=device, dtype=compute_dtype)[None, :]
-        depths = near[:, None] + (far - near)[:, None] * t_vals
+            scale = (
+                    2.0 / (vol_shape - 1)
+            ).view(1, 1, 1, 1, 3)
 
-        # What should be correct ijk coordinate math. Want to compute within kernel to avoid materializing large tensor
-        #ijk = scale * origin_ijk[:, None, None, None, :] + dirs_ijk.unsqueeze(1) * depths[:, :, None, None, None] - 1
+            t_vals = torch.linspace(0, 1, self.ray_samples, device=device, dtype=compute_dtype)[None, :]
+            depths = near[:, None] + (far - near)[:, None] * t_vals
 
-        fused_sum = _FusedVolumeRenderFunction.apply(
-            density,
-            dirs_ijk,
-            origin_ijk,
-            depths,
-            scale,
-            vol_shape
-        )  # returned in compute_dtype (see _acc_dtype_for)
+            # What should be correct ijk coordinate math. Want to compute within kernel to avoid materializing large tensor
+            #ijk = scale * origin_ijk[:, None, None, None, :] + dirs_ijk.unsqueeze(1) * depths[:, :, None, None, None] - 1
 
-        step_size = (
-                0.1
-                * (far - near)
-                / self.ray_samples
-        ).view(B, 1, 1, 1)
+            fused_sum = _FusedVolumeRenderFunction.apply(
+                density,
+                dirs_ijk,
+                origin_ijk,
+                depths,
+                scale,
+                vol_shape
+            )  # returned in compute_dtype (see _acc_dtype_for)
 
-        scaled_extinction = torch.exp(
-            -fused_sum * step_size
-        )
+            step_size = (
+                    0.1
+                    * (far - near)
+                    / self.ray_samples
+            ).view(B, 1, 1, 1)
 
-        out = 1.0 - self.apply_poisson(scaled_extinction)
+            scaled_extinction = torch.exp(
+                -fused_sum * step_size
+            )
 
-        # Restore the caller's dtype at the boundary — internal math stayed
-        # at compute_dtype for accuracy, but callers shouldn't be surprised
-        # by a fp16 volume producing an fp32 render.
-        return out.to(orig_dtype)
+            out = 1.0 - self.apply_poisson(scaled_extinction)
+
+            # Restore the caller's dtype at the boundary — internal math stayed
+            # at compute_dtype for accuracy, but callers shouldn't be surprised
+            # by a fp16 volume producing an fp32 render.
+            return out.to(orig_dtype)
