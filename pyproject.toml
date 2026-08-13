@@ -65,7 +65,7 @@ dependencies = [
     "psutil",
     "tqdm",
     "h5py",
-    "monai[itk]",
+    "monai",
     "requests",
     "triton >= 2.1; sys_platform != 'win32'",
     "triton-windows >= 3.0; sys_platform == 'win32'",
